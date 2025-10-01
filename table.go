@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"unsafe"
 )
 
 // Table holds a trained symbol table for compression and decompression.
@@ -12,33 +13,33 @@ import (
 // After training, a Table can be serialized with WriteTo and restored with ReadFrom.
 type Table struct {
 	// Symbol lookup structures (for encoding)
-	shortCodes [65536]uint16
-	byteCodes  [256]uint16
-	symbols    [fsstCodeMax]symbol
-	hashTab    [fsstHashTabSize]symbol
+	shortCodes [65536]uint16           // 2-byte prefix -> [length|code], fast unique 2B path
+	byteCodes  [256]uint16             // 1-byte -> [length|code], single-byte and escape fallback
+	symbols    [fsstCodeMax]symbol     // canonical code -> symbol (value+length)
+	hashTab    [fsstHashTabSize]symbol // direct-mapped 3–8B symbols keyed by first 3 bytes
 
 	// Symbol metadata
-	nSymbols  uint16
-	suffixLim uint16
-	lenHisto  [8]uint16
+	nSymbols  uint16    // number of learned symbols (0..255)
+	suffixLim uint16    // end of unique 2B region [0..suffixLim)
+	lenHisto  [8]uint16 // histogram of lengths 1..8 at indices 0..7
 
 	// Encoder state (lazy-initialized on first Encode)
 	// accelReady: true when shortCodes/byteCodes/hashTab are populated for encoding.
 	//             Rebuilt lazily after deserialization to avoid cost if only decoding.
 	// noSuffixOpt/avoidBranch: encoding strategy flags chosen based on symbol statistics.
 	// encBuf: reusable chunk buffer (fsstChunkSize+fsstChunkPadding bytes) to avoid allocation per call.
-	accelReady  bool
-	noSuffixOpt bool
-	avoidBranch bool
-	encBuf      []byte
+	accelReady  bool   // encoder lookup structures are ready
+	noSuffixOpt bool   // enable 2-byte fast path without suffix check
+	avoidBranch bool   // prefer branchless emission in encodeChunk
+	encBuf      []byte // scratch chunk buffer used by Encode
 
 	// Decoder state (lazy-initialized on first Decode)
 	// decLen/decSymbol: flattened arrays for fast decoding (indexed by code).
 	//                   Built lazily to avoid cost if only encoding.
 	// decReady: true when decoder arrays are populated.
-	decLen    [255]byte
-	decSymbol [255]uint64
-	decReady  bool
+	decLen    [255]byte   // code → symbol length
+	decSymbol [255]uint64 // code → symbol value (little-endian)
+	decReady  bool        // decoder lookup tables are ready
 }
 
 // Version is the FSST format version (publication date: February 18, 2019).
@@ -63,7 +64,7 @@ func newTable() *Table {
 	emptySymbol := symbol{}
 	emptySymbol.val = 0
 	emptySymbol.icl = fsstICLFree
-	for i := 0; i < fsstHashTabSize; i++ {
+	for i := range fsstHashTabSize {
 		t.hashTab[i] = emptySymbol
 	}
 	// fill byteCodes with pseudo code (escaped bytes)
@@ -77,6 +78,9 @@ func newTable() *Table {
 	return t
 }
 
+// clearSymbols removes all learned symbols from the Table and restores the
+// lookup structures (byteCodes/shortCodes/hashTab) to their default state.
+// It also resets the length histogram and learned symbol count.
 func (t *Table) clearSymbols() {
 	for i := range t.lenHisto {
 		t.lenHisto[i] = 0
@@ -98,6 +102,9 @@ func (t *Table) clearSymbols() {
 	t.nSymbols = 0
 }
 
+// hashInsert inserts a 3+ byte symbol into the direct-mapped hash table.
+// It stores the symbol with masked value (ignore high bytes) and returns
+// false if the target slot is already occupied.
 func (t *Table) hashInsert(sym symbol) bool {
 	hashIndex := sym.hash() & (fsstHashTabSize - 1)
 	taken := t.hashTab[hashIndex].icl < fsstICLFree
@@ -111,6 +118,12 @@ func (t *Table) hashInsert(sym symbol) bool {
 	return true
 }
 
+// addSymbol assigns a new code to sym and installs it into the appropriate
+// lookup structure based on its length:
+//
+//	1 byte -> byteCodes, 2 bytes -> shortCodes, 3–8 bytes -> hashTab.
+//
+// Returns false if capacity is exceeded or hash slot is taken.
 func (t *Table) addSymbol(sym symbol) bool {
 	if int(fsstCodeBase)+int(t.nSymbols) >= fsstCodeMax {
 		return false
@@ -164,6 +177,9 @@ func (t *Table) findLongestSymbol(sym symbol) uint16 {
 // - 1-byte symbols decode directly from byteCodes array
 // - 2-byte symbols without prefix conflicts decode from shortCodes without hash check
 // - Remaining symbols (conflicting 2-byte and long symbols) use hash table lookup
+//
+// Effects: updates code assignments in symbols[], sets suffixLim accordingly,
+// preserves lengths, and leaves rebuilding of fast lookup tables to rebuildIndices.
 func (t *Table) finalize() {
 	// Precondition: nSymbols <= 255
 	newCode := make([]uint8, 256)
@@ -182,7 +198,7 @@ func (t *Table) finalize() {
 
 	// Assign new codes, partitioning 2-byte symbols by prefix uniqueness
 	conflictingTwoByteCode := int(codeStart[2]) // Codes for conflicting 2-byte symbols (count down)
-	for i := 0; i < int(t.nSymbols); i++ {
+	for i := range int(t.nSymbols) {
 		sym := t.symbols[int(fsstCodeBase)+i]
 		length := sym.length()
 
@@ -233,8 +249,10 @@ func (t *Table) WriteTo(w io.Writer) (int64, error) {
 		(uint64(t.suffixLim) << 16) |
 		(uint64(t.nSymbols) << 8) |
 		1
-	var n int64
-	var buf8 [8]byte
+	var (
+		n    int64
+		buf8 [8]byte
+	)
 	binary.LittleEndian.PutUint64(buf8[:], ver)
 	if nn, err := w.Write(buf8[:]); err != nil {
 		return n, err
@@ -242,9 +260,11 @@ func (t *Table) WriteTo(w io.Writer) (int64, error) {
 		n += int64(nn)
 	}
 	// Write lenHisto derived from symbols to avoid relying on stored state
-	var lh [8]byte
-	var hist [8]uint16
-	for i := 0; i < int(t.nSymbols); i++ {
+	var (
+		lh   [8]byte
+		hist [8]uint16
+	)
+	for i := range int(t.nSymbols) {
 		length := t.symbols[i].length()
 		if length >= 1 && length <= 8 {
 			hist[length-1]++
@@ -259,7 +279,7 @@ func (t *Table) WriteTo(w io.Writer) (int64, error) {
 		n += int64(nn)
 	}
 	// symbol bytes
-	for i := 0; i < int(t.nSymbols); i++ {
+	for i := range int(t.nSymbols) {
 		sym := t.symbols[i]
 		symbolLength := int(sym.length())
 		for byteIdx := range symbolLength {
@@ -277,8 +297,10 @@ func (t *Table) WriteTo(w io.Writer) (int64, error) {
 // ReadFrom deserializes a Table from r using the compact FSST header format.
 func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 	*t = *newTable() // reset
-	var n int64
-	var hdr [8]byte
+	var (
+		n   int64
+		hdr [8]byte
+	)
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return n, err
 	}
@@ -317,7 +339,7 @@ func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 		pos++
 	}
 	// now read symbols accordingly
-	for i := 0; i < int(t.nSymbols); i++ {
+	for i := range int(t.nSymbols) {
 		symbolLength := int(lens[i])
 		var b8 [8]byte
 		if _, err := io.ReadFull(r, b8[:symbolLength]); err != nil {
@@ -352,8 +374,10 @@ func (t *Table) UnmarshalBinary(data []byte) error {
 	return err
 }
 
-// rebuildIndices reconstructs byteCodes, shortCodes, and hashTab from the finalized symbols.
-// It preserves existing code assignments (set in symbols[i]).
+// rebuildIndices reconstructs byteCodes, shortCodes, and hashTab from the
+// finalized symbols. It preserves existing code assignments (already set in
+// symbols[i]) and only rebuilds the derived lookup structures. Safe to call
+// multiple times; it is a no-op if accelReady is already true.
 func (t *Table) rebuildIndices() {
 	if t.accelReady {
 		return
@@ -434,6 +458,16 @@ func (t *Table) Encode(input []byte) []byte {
 
 // encodeChunk compresses a single chunk and appends output codes to dst.
 // buf must have at least 8 bytes of padding after end for safe unaligned loads.
+//
+// Match order (fastest first):
+// 1) Optional fast 2-byte unique-prefix path (when noSuffixOpt is true)
+// 2) 3–8 byte hash-table match (longest available)
+// 3) 2-byte short-code path (when within suffixLim)
+// 4) 1-byte or escape fallback
+//
+// Strategy flags:
+// - noSuffixOpt: skip suffix checking for most 2-byte symbols (higher hit rate)
+// - avoidBranch: use branchless emission when distribution makes branches costly
 func (t *Table) encodeChunk(dst, buf []byte, end int, byteLim uint8) []byte {
 	position := 0
 
@@ -492,8 +526,10 @@ func (t *Table) encodeChunk(dst, buf []byte, end int, byteLim uint8) []byte {
 	return dst
 }
 
-// Decode decompresses a byte slice and returns a new decompressed slice.
-func (t *Table) Decode(in []byte) []byte {
+// Decode decompresses src into dst and returns the number of bytes written.
+// It panics if dst is not large enough to hold the decompressed output.
+// For unknown output sizes, use DecodeAll which allocates.
+func (t *Table) Decode(dst, src []byte) int {
 	// Lazy-initialize decoder structures
 	if !t.decReady {
 		for code := uint16(0); code < t.nSymbols; code++ {
@@ -504,29 +540,97 @@ func (t *Table) Decode(in []byte) []byte {
 		t.decReady = true
 	}
 
-	out := make([]byte, 0, len(in)*4+8)
-	inputPos := 0
-	for inputPos < len(in) {
-		code := in[inputPos]
-		inputPos++
+	var (
+		buf    [8]byte
+		dstPos = 0
+		srcPos = 0
+	)
+
+	for srcPos < len(src) {
+		code := src[srcPos]
+		srcPos++
 		if code < fsstEscapeCode {
-			// Decode learned symbol: extract bytes from packed uint64
+			// Decode learned symbol
 			symbolLength := int(t.decLen[code])
 			symbolValue := t.decSymbol[code]
-			for i := 0; i < symbolLength; i++ {
-				out = append(out, byte(symbolValue))
-				symbolValue >>= 8 // Shift to next byte (little-endian)
+
+			// Check buffer space
+			if dstPos+symbolLength > len(dst) {
+				panic("fsst: decode buffer too small")
 			}
+
+			// Batch write: use PutUint64 + copy
+			binary.LittleEndian.PutUint64(buf[:], symbolValue)
+			copy(dst[dstPos:dstPos+symbolLength], buf[:symbolLength])
+			dstPos += symbolLength
 		} else {
 			// Escape code: next byte is literal
-			if inputPos >= len(in) {
+			if srcPos >= len(src) {
 				break
 			}
-			out = append(out, in[inputPos])
-			inputPos++
+			if dstPos >= len(dst) {
+				panic("fsst: decode buffer too small")
+			}
+			dst[dstPos] = src[srcPos]
+			dstPos++
+			srcPos++
 		}
 	}
-	return out
+	return dstPos
+}
+
+// DecodeAll decompresses src and returns a newly allocated byte slice with the result.
+func (t *Table) DecodeAll(src []byte) []byte {
+	// Pre-allocate with generous capacity (4x input + padding)
+	dst := make([]byte, 0, len(src)*4+8)
+	return t.decodeAppend(dst, src)
+}
+
+// DecodeString decompresses a string and returns a newly allocated byte slice.
+func (t *Table) DecodeString(s string) []byte {
+	return t.DecodeAll(unsafe.Slice(unsafe.StringData(s), len(s)))
+}
+
+// decodeAppend is the internal append-style decoder used by DecodeAll/DecodeString.
+func (t *Table) decodeAppend(dst, src []byte) []byte {
+	// Lazy-initialize decoder structures
+	if !t.decReady {
+		for code := uint16(0); code < t.nSymbols; code++ {
+			sym := t.symbols[code]
+			t.decLen[code] = byte(sym.length())
+			t.decSymbol[code] = sym.val
+		}
+		t.decReady = true
+	}
+
+	var (
+		buf    [8]byte
+		srcPos = 0
+	)
+
+	for srcPos < len(src) {
+		code := src[srcPos]
+		srcPos++
+		if code < fsstEscapeCode {
+			// Decode learned symbol
+			symbolLength := int(t.decLen[code])
+			symbolValue := t.decSymbol[code]
+
+			// Batch write: grow slice once, then copy bytes
+			startIdx := len(dst)
+			dst = append(dst, buf[:symbolLength]...)
+			binary.LittleEndian.PutUint64(buf[:], symbolValue)
+			copy(dst[startIdx:], buf[:symbolLength])
+		} else {
+			// Escape code: next byte is literal
+			if srcPos >= len(src) {
+				break
+			}
+			dst = append(dst, src[srcPos])
+			srcPos++
+		}
+	}
+	return dst
 }
 
 // chooseVariant selects the best encoding strategy based on symbol statistics.

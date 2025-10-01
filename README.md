@@ -33,7 +33,12 @@ tbl := fsst.Train(inputs)
 
 // Compress and decompress
 compressed := tbl.Encode([]byte(`{"id":789,"name":"Charlie"}`))
-original := tbl.Decode(compressed)
+original := tbl.DecodeAll(compressed)
+
+// Or decode into a fixed buffer for zero-allocation
+dst := make([]byte, 1024)
+n := tbl.Decode(dst, compressed)
+_ = dst[:n] // decompressed data
 
 // Serialize table for reuse
 data, _ := tbl.MarshalBinary()

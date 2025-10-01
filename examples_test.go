@@ -12,7 +12,7 @@ func Example() {
 	tbl := Train(inputs)
 	for _, input := range inputs {
 		comp := tbl.Encode(input)
-		orig := tbl.Decode(comp)
+		orig := tbl.DecodeAll(comp)
 		fmt.Println(string(orig))
 	}
 	// Output:

@@ -1,7 +1,7 @@
 package fsst
 
 import (
-	"sort"
+	"container/heap"
 	"unsafe"
 )
 
@@ -16,10 +16,15 @@ const (
 	rngSeed             = 4637947
 )
 
+// Train builds and finalizes a compression Table from the provided corpora.
+// It samples inputs, iteratively parses and counts symbol usage, proposes
+// merged symbols, retains top-gain candidates, and finalizes code layout.
 func Train(inputs [][]byte) *Table {
-	sample := makeSample(inputs)
-	table := newTable()
-	counter := &counters{}
+	var (
+		sample  = makeSample(inputs)
+		table   = newTable()
+		counter = &counters{}
+	)
 
 	for frac := 8; ; frac += 30 {
 		*counter = counters{}
@@ -33,14 +38,20 @@ func Train(inputs [][]byte) *Table {
 	return table
 }
 
+// findNextSymbolFast returns the best match at data[position:] using the
+// current Table: prefer 3–8 byte hash hits, then unique 2-byte short codes,
+// otherwise fall back to single-byte. Returns code and matched length.
 func findNextSymbolFast(t *Table, data []byte, position int) (code uint16, advance int) {
-	word := fsstUnalignedLoad(data[position:])
-	prefix24 := word & fsstMask24
-	hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
-	hashSymbol := t.hashTab[hashIndex]
-	shortCode := t.shortCodes[uint16(word&fsstMask16)] & fsstCodeMask
-	symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
-	maskedWord := word & symbolMask
+	var (
+		word       = fsstUnalignedLoad(data[position:])
+		prefix24   = word & fsstMask24
+		hashIndex  = fsstHash(prefix24) & (fsstHashTabSize - 1)
+		hashSymbol = t.hashTab[hashIndex]
+		shortCode  = t.shortCodes[uint16(word&fsstMask16)] & fsstCodeMask
+		symbolMask = ^uint64(0) >> hashSymbol.ignoredBits()
+		maskedWord = word & symbolMask
+	)
+
 	if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
 		return hashSymbol.code(), int(hashSymbol.length())
 	}
@@ -50,6 +61,9 @@ func findNextSymbolFast(t *Table, data []byte, position int) (code uint16, advan
 	return t.byteCodes[byte(word&fsstMask8)] & fsstCodeMask, 1
 }
 
+// compressCount walks the sample as the encoder would with the current Table,
+// incrementing single counts and (in early rounds) pair counts to drive
+// candidate selection in the subsequent build step.
 func compressCount(t *Table, c *counters, sample [][]byte, frac int) {
 	for i := range sample {
 		if frac < 128 && int(fsstHash(uint64(i))&fsstSampleMask) > frac {
@@ -72,8 +86,10 @@ func compressCount(t *Table, c *counters, sample [][]byte, frac int) {
 				break
 			}
 			start = pos
-			var next uint16
-			var adv int
+			var (
+				next uint16
+				adv  int
+			)
 			if pos < end-7 {
 				next, adv = findNextSymbolFast(t, sample[i], pos)
 				pos += adv
@@ -98,6 +114,41 @@ type qsym struct {
 	gain   uint32
 }
 
+// qsymHeap is a min-heap of qsym based on gain (with tiebreak on symbol.val).
+// We use a min-heap to maintain top-K elements efficiently.
+type qsymHeap []qsym
+
+// Len implements heap.Interface and returns the number of elements.
+func (h qsymHeap) Len() int { return len(h) }
+
+// Less implements heap.Interface ordering by ascending gain, breaking ties
+// by larger symbol value to keep selection deterministic.
+func (h qsymHeap) Less(i, j int) bool {
+	// Min-heap: smaller gain at root (or larger val for tiebreak)
+	if h[i].gain != h[j].gain {
+		return h[i].gain < h[j].gain
+	}
+	return h[i].symbol.val > h[j].symbol.val
+}
+
+// Swap implements heap.Interface swap.
+func (h qsymHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+// Push implements heap.Interface push.
+func (h *qsymHeap) Push(x any) { *h = append(*h, x.(qsym)) }
+
+// Pop implements heap.Interface pop.
+func (h *qsymHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// buildCandidates creates symbol candidates from current counters. It boosts
+// single bytes, considers merged pairs (except in the last round), scores by
+// gain≈frequency×length, keeps top-K via a min-heap, and updates the Table.
 func buildCandidates(t *Table, c *counters, frac int) {
 	candidates := make(map[[2]uint64]qsym)
 	minCount := max((minCountNumerator*frac)/minCountDenominator, 1)
@@ -140,16 +191,32 @@ func buildCandidates(t *Table, c *counters, frac int) {
 		}
 	}
 
-	list := make([]qsym, 0, len(candidates))
+	// Use min-heap to efficiently select top fsstMaxSymbols candidates
+	// This is O(n log k) instead of O(n log n) where k=255, n=candidates
+	h := make(qsymHeap, 0, fsstMaxSymbols+1)
+	heap.Init(&h)
+
 	for _, candidate := range candidates {
-		list = append(list, candidate)
-	}
-	sort.Slice(list, func(i, j int) bool {
-		if list[i].gain != list[j].gain {
-			return list[i].gain > list[j].gain
+		if len(h) < fsstMaxSymbols {
+			heap.Push(&h, candidate)
+		} else if candidate.gain > h[0].gain ||
+			(candidate.gain == h[0].gain && candidate.symbol.val < h[0].symbol.val) {
+			// Replace minimum with this better candidate
+			heap.Pop(&h)
+			heap.Push(&h, candidate)
 		}
-		return list[i].symbol.val < list[j].symbol.val
-	})
+	}
+
+	// Extract and sort the top-K (small enough to sort efficiently)
+	list := make([]qsym, len(h))
+	for i := len(h) - 1; i >= 0; i-- {
+		list[i] = heap.Pop(&h).(qsym)
+	}
+
+	// Reverse to get descending order (heap gave us ascending)
+	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
+		list[i], list[j] = list[j], list[i]
+	}
 
 	t.clearSymbols()
 	for i := 0; i < len(list) && int(t.nSymbols) < fsstMaxSymbols; i++ {
@@ -157,6 +224,7 @@ func buildCandidates(t *Table, c *counters, frac int) {
 	}
 }
 
+// TrainStrings converts []string to [][]byte and calls Train.
 func TrainStrings(inputs []string) *Table {
 	bytes := make([][]byte, len(inputs))
 	for i := range inputs {
@@ -165,6 +233,8 @@ func TrainStrings(inputs []string) *Table {
 	return Train(bytes)
 }
 
+// makeSample assembles a ~16KB deterministic pseudo-random sample composed of
+// 512-byte slices from the inputs to keep training fast yet representative.
 func makeSample(inputs [][]byte) [][]byte {
 	var total int
 	for i := range inputs {
@@ -175,9 +245,11 @@ func makeSample(inputs [][]byte) [][]byte {
 		return inputs
 	}
 
-	buf := make([]byte, fsstSampleMaxSz)
-	sample := make([][]byte, 0, len(inputs))
-	pos := 0
+	var (
+		buf    = make([]byte, fsstSampleMaxSz)
+		sample = make([][]byte, 0, len(inputs))
+		pos    = 0
+	)
 
 	rng := fsstHash(rngSeed)
 

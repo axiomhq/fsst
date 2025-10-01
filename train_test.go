@@ -41,7 +41,7 @@ func TestTrainEncodeDecode(t *testing.T) {
 	tbl := Train(inputs)
 	for i := range inputs {
 		comp := tbl.Encode(inputs[i])
-		got := tbl.Decode(comp)
+		got := tbl.DecodeAll(comp)
 		if string(got) != string(inputs[i]) {
 			t.Fatalf("roundtrip mismatch: %q != %q", got, inputs[i])
 		}
@@ -79,7 +79,7 @@ func TestTwoByteAndLongSymbolCompression(t *testing.T) {
 	if len(comp) >= len(inputs[0]) {
 		t.Fatalf("expected some compression, got %d >= %d", len(comp), len(inputs[0]))
 	}
-	got := tbl.Decode(comp)
+	got := tbl.DecodeAll(comp)
 	if !bytes.Equal(got, inputs[0]) {
 		t.Fatalf("roundtrip mismatch")
 	}
@@ -99,7 +99,7 @@ func TestChunkBoundariesRoundtrip(t *testing.T) {
 	tbl := Train(inputs)
 	for i := range inputs {
 		comp := tbl.Encode(inputs[i])
-		got := tbl.Decode(comp)
+		got := tbl.DecodeAll(comp)
 		if !bytes.Equal(got, inputs[i]) {
 			t.Fatalf("roundtrip mismatch at size %d", sizes[i])
 		}
@@ -110,7 +110,7 @@ func TestTrainOnEmpty(t *testing.T) {
 	tbl := Train(nil)
 	input := []byte("the quick brown fox jumped over the lazy dog")
 	comp := tbl.Encode(input)
-	got := tbl.Decode(comp)
+	got := tbl.DecodeAll(comp)
 	if !bytes.Equal(got, input) {
 		t.Fatalf("roundtrip mismatch on empty-trained table")
 	}
@@ -121,7 +121,7 @@ func TestZerosRoundtrip(t *testing.T) {
 	tbl := Train([][]byte{training})
 	input := []byte{4, 0}
 	comp := tbl.Encode(input)
-	got := tbl.Decode(comp)
+	got := tbl.DecodeAll(comp)
 	if !bytes.Equal(got, input) {
 		t.Fatalf("zeros roundtrip mismatch: %v != %v", got, input)
 	}
@@ -153,7 +153,7 @@ func TestCorpusRoundtrip(t *testing.T) {
 
 			for i := range lines {
 				comp := tbl.Encode(bLines[i])
-				got := tbl.Decode(comp)
+				got := tbl.DecodeAll(comp)
 				if !bytes.Equal(got, bLines[i]) {
 					t.Fatalf("roundtrip mismatch for %s", path)
 				}
@@ -215,7 +215,7 @@ func BenchmarkCorpusCompressionSuite(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for b.Loop() {
-					got := tbl.Decode(comp)
+					got := tbl.DecodeAll(comp)
 					if !bytes.Equal(got, data) {
 						b.Fatalf("roundtrip mismatch")
 					}
@@ -259,8 +259,8 @@ func TestRebuildCompressionDeterminism(t *testing.T) {
 		}
 
 		// Sanity check roundtrips
-		got1 := tbl.Decode(comp)
-		got2 := tbl2.Decode(comp2)
+		got1 := tbl.DecodeAll(comp)
+		got2 := tbl2.DecodeAll(comp2)
 		if !bytes.Equal(got1, b) || !bytes.Equal(got2, b) {
 			t.Fatalf("roundtrip mismatch at line %d", i)
 		}
@@ -284,7 +284,7 @@ func TestTrainStrings(t *testing.T) {
 
 	for i := range inputs {
 		comp := tbl.Encode(inputs[i])
-		got := tbl.Decode(comp)
+		got := tbl.DecodeAll(comp)
 		if string(got) != strs[i] {
 			t.Fatalf("TrainStrings roundtrip mismatch: got %q, want %q", got, strs[i])
 		}
@@ -338,7 +338,7 @@ func TestEdgeCases(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tbl := Train([][]byte{tt.input})
 			comp := tbl.Encode(tt.input)
-			got := tbl.Decode(comp)
+			got := tbl.DecodeAll(comp)
 
 			if !bytes.Equal(got, tt.input) {
 				t.Fatalf("edge case %s: roundtrip mismatch", tt.name)
@@ -361,7 +361,7 @@ func TestCompressionRatio(t *testing.T) {
 	}
 
 	// Verify roundtrip
-	got := tbl.Decode(comp)
+	got := tbl.DecodeAll(comp)
 	if !bytes.Equal(got, repetitive) {
 		t.Fatalf("compression roundtrip failed")
 	}
@@ -399,7 +399,7 @@ func FuzzCompressRoundtrip(f *testing.F) {
 		// Verify all inputs roundtrip correctly
 		for i := range inputs {
 			comp := tbl.Encode(inputs[i])
-			got := tbl.Decode(comp)
+			got := tbl.DecodeAll(comp)
 			if !bytes.Equal(got, inputs[i]) {
 				t.Fatalf("roundtrip mismatch for input %d", i)
 			}
@@ -439,7 +439,7 @@ func FuzzDecoder(f *testing.F) {
 		// Create a simple table
 		tbl := Train([][]byte{[]byte("test")})
 		// Should never panic on any compressed data
-		_ = tbl.Decode(compressedData)
+		_ = tbl.DecodeAll(compressedData)
 	})
 }
 
@@ -457,7 +457,7 @@ func FuzzLargeInputs(f *testing.F) {
 
 		tbl := Train([][]byte{data})
 		comp := tbl.Encode(data)
-		got := tbl.Decode(comp)
+		got := tbl.DecodeAll(comp)
 
 		if !bytes.Equal(got, data) {
 			t.Fatalf("large input roundtrip mismatch: len(input)=%d len(got)=%d", len(data), len(got))

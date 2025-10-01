@@ -57,7 +57,7 @@ func TestRebuildTableRoundtrip(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 	comp := tbl2.Encode(input)
-	got := tbl2.Decode(comp)
+	got := tbl2.DecodeAll(comp)
 	if !bytes.Equal(got, input) {
 		t.Fatalf("rebuild roundtrip mismatch")
 	}
@@ -74,8 +74,64 @@ func TestTableLimits(t *testing.T) {
 	tbl := Train(inputs)
 	// Verify it still works
 	comp := tbl.Encode(inputs[0])
-	got := tbl.Decode(comp)
+	got := tbl.DecodeAll(comp)
 	if !bytes.Equal(got, inputs[0]) {
 		t.Fatalf("roundtrip failed with many symbols")
 	}
+}
+
+// TestDecodeAPIs tests all decode variants
+func TestDecodeAPIs(t *testing.T) {
+	input := []byte("Hello, World! This is a test message for FSST compression.")
+	tbl := Train([][]byte{input})
+	comp := tbl.Encode(input)
+
+	// Test DecodeAll
+	t.Run("DecodeAll", func(t *testing.T) {
+		got := tbl.DecodeAll(comp)
+		if !bytes.Equal(got, input) {
+			t.Fatalf("DecodeAll mismatch: got %q, want %q", got, input)
+		}
+	})
+
+	// Test Decode with sufficient buffer
+	t.Run("Decode_sufficient", func(t *testing.T) {
+		dst := make([]byte, len(input)*2) // Generous buffer
+		n := tbl.Decode(dst, comp)
+		if !bytes.Equal(dst[:n], input) {
+			t.Fatalf("Decode mismatch: got %q, want %q", dst[:n], input)
+		}
+	})
+
+	// Test Decode with exact buffer
+	t.Run("Decode_exact", func(t *testing.T) {
+		dst := make([]byte, len(input))
+		n := tbl.Decode(dst, comp)
+		if n != len(input) {
+			t.Fatalf("Decode returned %d bytes, want %d", n, len(input))
+		}
+		if !bytes.Equal(dst[:n], input) {
+			t.Fatalf("Decode mismatch")
+		}
+	})
+
+	// Test Decode with too-small buffer (should panic)
+	t.Run("Decode_panic", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("Decode should panic with small buffer")
+			}
+		}()
+		dst := make([]byte, 5) // Too small
+		tbl.Decode(dst, comp)
+	})
+
+	// Test DecodeString
+	t.Run("DecodeString", func(t *testing.T) {
+		compStr := string(comp)
+		got := tbl.DecodeString(compStr)
+		if !bytes.Equal(got, input) {
+			t.Fatalf("DecodeString mismatch: got %q, want %q", got, input)
+		}
+	})
 }
