@@ -67,10 +67,6 @@ Best suited for:
 go get github.com/axiomhq/fsst
 ```
 
-## Contributing
-
-Kindly check our [contributing guide](https://github.com/axiomhq/fsst/blob/main/Contributing.md) on how to propose bugfixes and improvements, and submitting pull requests to the project.
-
 ## License
 
 &copy; Axiom, Inc., 2025
