@@ -51,8 +51,8 @@ tbl2.UnmarshalBinary(data)
 FSST is optimized for workloads requiring fast decompression:
 
 * **Training**: O(n × k) where n is input size, k is number of training rounds (5)
-* **Encoding**: ~200-500 MB/s
-* **Decoding**: ~1-2 GB/s (table lookup)
+* **Encoding**: O(n) where n is uncompressed input size
+* **Decoding**: O(m) where m is compressed input size (table lookup)
 * **Compression ratio**: 1.5x to 3x on structured/repetitive text
 * **Table size**: 2-8 KB
 
