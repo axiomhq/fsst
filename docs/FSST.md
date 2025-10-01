@@ -142,3 +142,46 @@ _ = t.UnmarshalBinary(data)
 - Always verify: encode→decode roundtrips on `testdata/`, monitor `lenHisto` and `suffixLim`, and benchmark speed/ratio trade-offs.
 
 
+---
+
+## Walkthrough: five-iteration training on "the brown fox..."
+
+Corpus (toy):
+```
+the brown fox jumps over the brown fox
+```
+
+### Iteration 1 (only 1-byte symbols initially)
+- Parsing advances 1 byte at a time; we count singles and byte→byte pairs.
+- Frequent pairs (examples): `th`, `he`, `e `, ` b`, `br`, `ro`, `ow`, `wn`, `n `, ` f`, `fo`, `ox`, `x `, `ov`, `ve`, `er`.
+- Top candidates by gain (≈ freq × length): mostly 2-byte bigrams above.
+- Table update: install best 2B symbols; finalize splits unique 2B prefixes to fast `shortCodes`.
+
+### Iteration 2 (2-byte symbols active)
+- Parsing uses 2B hits where available; remaining bytes fall back to 1B.
+- Pairs now operate over symbol codes (2B→2B, 2B→1B, etc.).
+- Merged candidates: short phrases like `the`, `he `, `bro`, `own`, `fox`, `ove`, `ver`.
+- Table update: add 3–4B phrases (e.g., `the`, `he `, `brown`, `over`, `fox`) to the hash path.
+
+### Iteration 3 (longer symbols form)
+- Many occurrences compress to 3–5B matches (`brown`, `over`, `the`, `he `, `fox`).
+- New merges target boundaries: ` brown`, ` the `, ` over`, `brown `, `brown fox`.
+- Table update: add high-gain 5–8B phrases (e.g., `brown `, ` the `, ` over `).
+
+### Iteration 4 (vocabulary stabilizes)
+- Parsing favors longest-first (hash), then 2B `shortCodes`, then 1B.
+- New merges: ` over the `, `brown fox`, ` the b`.
+- Table update: add select 7–8B phrases (e.g., `brown fox`, ` over the `).
+
+### Iteration 5 (final; pairs disabled)
+- Only singles considered; consolidates strongest symbols, no new merges.
+- Final table (illustrative):
+  - 1B: literals like space/vowels
+  - 2B (shortCodes): `br`, `ro`, `ow`, `wn`, `fo`, `ox`, `ov`, `ve`, `er`, `th`, `he`, `e `
+  - 3–8B (hashTab): `the`, `he `, `brown`, `over`, `fox`, `brown `, ` the `, ` over `, `brown fox`, ` over the`
+
+Encoding usage
+- At each position: try 2B fast path (when enabled), then look up 3–8B in hash, else 2B slow path, else 1B/escape.
+- Phrases like `brown fox` or ` over the ` compress to single code bytes.
+
+
