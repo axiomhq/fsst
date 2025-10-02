@@ -459,7 +459,6 @@ func (t *Table) Encode(buf, input []byte) []byte {
 	for chunkStart := 0; chunkStart < len(input); {
 		chunk := min(len(input)-chunkStart, fsstChunkSize)
 		copy(chunkBuf[:chunk], input[chunkStart:chunkStart+chunk])
-		chunkBuf[chunk] = 0 // Zero terminator + padding for unaligned loads
 		outPos = t.encodeChunk(buf, outPos, chunkBuf, chunk, byteLim)
 		chunkStart += chunk
 	}
@@ -509,7 +508,8 @@ func (t *Table) encodeChunkBranchedNoSuffix(dst []byte, dstPos int, buf []byte, 
 		code := t.shortCodes[uint16(word&fsstMask16)]
 
 		// Fast path: 2-byte code without suffix check
-		if uint8(code) < suffixLim {
+		// But only if we have at least 2 bytes remaining
+		if uint8(code) < suffixLim && position+2 <= end {
 			dst[dstPos] = uint8(code)
 			dstPos++
 			position += 2
@@ -522,14 +522,22 @@ func (t *Table) encodeChunkBranchedNoSuffix(dst []byte, dstPos int, buf []byte, 
 		hashSymbol := t.hashTab[hashIndex]
 		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
 		maskedWord := word & symbolMask
+		symbolLen := int(hashSymbol.length())
 
-		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
+		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord && position+symbolLen <= end {
 			dst[dstPos] = uint8(hashSymbol.code())
 			dstPos++
-			position += int(hashSymbol.length())
+			position += symbolLen
 		} else {
 			// 1-byte or escape fallback
 			escapeByte := uint8(word)
+
+			// If shortCodes gave us a 2-byte code but we only have 1 byte, use byteCodes instead
+			advance := int(code >> fsstLenBits)
+			if position+advance > end {
+				code = t.byteCodes[escapeByte]
+			}
+
 			codeU8 := uint8(code)
 			dst[dstPos] = codeU8
 			dstPos++
@@ -553,7 +561,8 @@ func (t *Table) encodeChunkBranched(dst []byte, dstPos int, buf []byte, end int,
 		codeU8 := uint8(code)
 
 		// Check if 2-byte shortCode is valid before hash lookup
-		if codeU8 < byteLim {
+		// But only if we have at least 2 bytes remaining
+		if codeU8 < byteLim && position+2 <= end {
 			dst[dstPos] = codeU8
 			dstPos++
 			position += 2
@@ -566,14 +575,23 @@ func (t *Table) encodeChunkBranched(dst []byte, dstPos int, buf []byte, end int,
 		hashSymbol := t.hashTab[hashIndex]
 		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
 		maskedWord := word & symbolMask
+		symbolLen := int(hashSymbol.length())
 
-		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
+		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord && position+symbolLen <= end {
 			dst[dstPos] = uint8(hashSymbol.code())
 			dstPos++
-			position += int(hashSymbol.length())
+			position += symbolLen
 		} else {
 			// 1-byte or escape fallback
 			escapeByte := uint8(word)
+
+			// If shortCodes gave us a 2-byte code but we only have 1 byte, use byteCodes instead
+			advance := int(code >> fsstLenBits)
+			if position+advance > end {
+				code = t.byteCodes[escapeByte]
+			}
+
+			codeU8 = uint8(code)
 			dst[dstPos] = codeU8
 			dstPos++
 			if (code & fsstCodeBase) != 0 {
@@ -596,7 +614,7 @@ func (t *Table) encodeChunkBranchlessNoSuffix(dst []byte, dstPos int, buf []byte
 		code := t.shortCodes[uint16(word&fsstMask16)]
 
 		// Fast path: 2-byte code without suffix check
-		if uint8(code) < suffixLim {
+		if uint8(code) < suffixLim && position+2 <= end {
 			dst[dstPos] = uint8(code)
 			dstPos++
 			position += 2
@@ -609,14 +627,23 @@ func (t *Table) encodeChunkBranchlessNoSuffix(dst []byte, dstPos int, buf []byte
 		hashSymbol := t.hashTab[hashIndex]
 		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
 		maskedWord := word & symbolMask
+		symbolLen := int(hashSymbol.length())
 
-		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
+		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord && position+symbolLen <= end {
 			dst[dstPos] = uint8(hashSymbol.code())
 			dstPos++
-			position += int(hashSymbol.length())
+			position += symbolLen
 		} else {
 			// Branchless fallback
+			advance := int(code >> fsstLenBits)
 			escapeByte := uint8(word)
+
+			// If we'd read past the end, use byteCodes for single byte instead
+			if position+advance > end {
+				code = t.byteCodes[escapeByte]
+				advance = 1
+			}
+
 			codeU8 := uint8(code)
 			dst[dstPos] = codeU8
 			dstPos++
@@ -624,7 +651,7 @@ func (t *Table) encodeChunkBranchlessNoSuffix(dst []byte, dstPos int, buf []byte
 				dst[dstPos] = escapeByte
 				dstPos++
 			}
-			position += int(code >> fsstLenBits)
+			position += advance
 		}
 	}
 	return dstPos
@@ -644,14 +671,23 @@ func (t *Table) encodeChunkBranchless(dst []byte, dstPos int, buf []byte, end in
 		hashSymbol := t.hashTab[hashIndex]
 		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
 		maskedWord := word & symbolMask
+		symbolLen := int(hashSymbol.length())
 
-		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
+		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord && position+symbolLen <= end {
 			dst[dstPos] = uint8(hashSymbol.code())
 			dstPos++
-			position += int(hashSymbol.length())
+			position += symbolLen
 		} else {
 			// Branchless fallback
+			advance := int(code >> fsstLenBits)
 			escapeByte := uint8(word)
+
+			// If we'd read past the end, use byteCodes for single byte instead
+			if position+advance > end {
+				code = t.byteCodes[escapeByte]
+				advance = 1
+			}
+
 			codeU8 := uint8(code)
 			dst[dstPos] = codeU8
 			dstPos++
@@ -659,7 +695,7 @@ func (t *Table) encodeChunkBranchless(dst []byte, dstPos int, buf []byte, end in
 				dst[dstPos] = escapeByte
 				dstPos++
 			}
-			position += int(code >> fsstLenBits)
+			position += advance
 		}
 	}
 	return dstPos
