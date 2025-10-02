@@ -778,7 +778,6 @@ func chooseVariant(t *Table) (noSuffixOpt, avoidBranch bool) {
 	// Check: 2-byte symbols > 65% of total AND non-conflicting 2-byte > 95% of 2-byte symbols
 	if 100*int(t.lenHisto[1]) > 65*int(t.nSymbols) && 100*int(t.suffixLim) > 95*int(t.lenHisto[1]) {
 		noSuffixOpt = true
-		return
 	}
 
 	// avoidBranch: symbol distribution is balanced, causing poor branch prediction
