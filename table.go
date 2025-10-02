@@ -486,65 +486,180 @@ func (t *Table) EncodeAll(input []byte) []byte {
 // - noSuffixOpt: skip suffix checking for most 2-byte symbols (higher hit rate)
 // - avoidBranch: use branchless emission when distribution makes branches costly
 func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int, byteLim uint8) int {
+	// Hoist strategy checks outside hot loop to eliminate redundant field access
+	if t.avoidBranch {
+		if t.noSuffixOpt {
+			return t.encodeChunkBranchlessNoSuffix(dst, dstPos, buf, end)
+		}
+		return t.encodeChunkBranchless(dst, dstPos, buf, end, byteLim)
+	}
+	if t.noSuffixOpt {
+		return t.encodeChunkBranchedNoSuffix(dst, dstPos, buf, end)
+	}
+	return t.encodeChunkBranched(dst, dstPos, buf, end, byteLim)
+}
+
+// encodeChunkBranchedNoSuffix: noSuffixOpt=true, avoidBranch=false
+func (t *Table) encodeChunkBranchedNoSuffix(dst []byte, dstPos int, buf []byte, end int) int {
 	position := 0
+	suffixLim := uint8(t.suffixLim)
 
 	for position < end {
 		word := fsstUnalignedLoad(buf[position:])
 		code := t.shortCodes[uint16(word&fsstMask16)]
 
 		// Fast path: 2-byte code without suffix check
-		if t.noSuffixOpt && uint8(code) < uint8(t.suffixLim) {
+		if uint8(code) < suffixLim {
 			dst[dstPos] = uint8(code)
 			dstPos++
 			position += 2
 			continue
 		}
 
-		// Check hash table for 3+ byte matches
-		prefix24 := word & fsstMask24 // First 3 bytes for hash lookup
+		// Hash table lookup for 3+ byte matches
+		prefix24 := word & fsstMask24
 		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
 		hashSymbol := t.hashTab[hashIndex]
-		escapeByte := uint8(word) // First byte to emit if no match found
-
-		// Build mask to compare only relevant bytes (mask out high bytes beyond symbol length)
-		// Example: for 3-byte symbol, mask = 0x0000000000FFFFFF (ignore top 5 bytes)
 		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
 		maskedWord := word & symbolMask
 
 		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
-			// Hash table hit: 3+ byte symbol match
 			dst[dstPos] = uint8(hashSymbol.code())
 			dstPos++
 			position += int(hashSymbol.length())
-		} else if t.avoidBranch {
-			// Branchless path: emit code and conditional escape
-			// code format: [length:4 bits][code:12 bits]
-			// Extract length to advance position
-			outputCode := uint8(code)
-			dst[dstPos] = outputCode
-			dstPos++
-			// If code >= 256, it's an escape marker (emit literal byte)
-			if (code & fsstCodeBase) != 0 {
-				dst[dstPos] = escapeByte
-				dstPos++
-			}
-			position += int(code >> fsstLenBits) // Extract length field
-		} else if uint8(code) < byteLim {
-			// 2-byte code (after checking for longer match)
-			dst[dstPos] = uint8(code)
-			dstPos++
-			position += 2
 		} else {
-			// 1-byte code or escape
-			outputCode := uint8(code)
-			dst[dstPos] = outputCode
+			// 1-byte or escape fallback
+			escapeByte := uint8(word)
+			codeU8 := uint8(code)
+			dst[dstPos] = codeU8
 			dstPos++
-			// If code >= 256, it's an escape marker (emit literal byte)
 			if (code & fsstCodeBase) != 0 {
 				dst[dstPos] = escapeByte
 				dstPos++
 			}
 			position++
+		}
+	}
+	return dstPos
+}
+
+// encodeChunkBranched: noSuffixOpt=false, avoidBranch=false
+func (t *Table) encodeChunkBranched(dst []byte, dstPos int, buf []byte, end int, byteLim uint8) int {
+	position := 0
+
+	for position < end {
+		word := fsstUnalignedLoad(buf[position:])
+		code := t.shortCodes[uint16(word&fsstMask16)]
+		codeU8 := uint8(code)
+
+		// Check if 2-byte shortCode is valid before hash lookup
+		if codeU8 < byteLim {
+			dst[dstPos] = codeU8
+			dstPos++
+			position += 2
+			continue
+		}
+
+		// Hash table lookup for 3+ byte matches
+		prefix24 := word & fsstMask24
+		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
+		hashSymbol := t.hashTab[hashIndex]
+		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
+		maskedWord := word & symbolMask
+
+		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
+			dst[dstPos] = uint8(hashSymbol.code())
+			dstPos++
+			position += int(hashSymbol.length())
+		} else {
+			// 1-byte or escape fallback
+			escapeByte := uint8(word)
+			dst[dstPos] = codeU8
+			dstPos++
+			if (code & fsstCodeBase) != 0 {
+				dst[dstPos] = escapeByte
+				dstPos++
+			}
+			position++
+		}
+	}
+	return dstPos
+}
+
+// encodeChunkBranchlessNoSuffix: noSuffixOpt=true, avoidBranch=true
+func (t *Table) encodeChunkBranchlessNoSuffix(dst []byte, dstPos int, buf []byte, end int) int {
+	position := 0
+	suffixLim := uint8(t.suffixLim)
+
+	for position < end {
+		word := fsstUnalignedLoad(buf[position:])
+		code := t.shortCodes[uint16(word&fsstMask16)]
+
+		// Fast path: 2-byte code without suffix check
+		if uint8(code) < suffixLim {
+			dst[dstPos] = uint8(code)
+			dstPos++
+			position += 2
+			continue
+		}
+
+		// Hash table lookup
+		prefix24 := word & fsstMask24
+		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
+		hashSymbol := t.hashTab[hashIndex]
+		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
+		maskedWord := word & symbolMask
+
+		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
+			dst[dstPos] = uint8(hashSymbol.code())
+			dstPos++
+			position += int(hashSymbol.length())
+		} else {
+			// Branchless fallback
+			escapeByte := uint8(word)
+			codeU8 := uint8(code)
+			dst[dstPos] = codeU8
+			dstPos++
+			if (code & fsstCodeBase) != 0 {
+				dst[dstPos] = escapeByte
+				dstPos++
+			}
+			position += int(code >> fsstLenBits)
+		}
+	}
+	return dstPos
+}
+
+// encodeChunkBranchless: noSuffixOpt=false, avoidBranch=true
+func (t *Table) encodeChunkBranchless(dst []byte, dstPos int, buf []byte, end int, byteLim uint8) int {
+	position := 0
+
+	for position < end {
+		word := fsstUnalignedLoad(buf[position:])
+		code := t.shortCodes[uint16(word&fsstMask16)]
+
+		// Hash table lookup
+		prefix24 := word & fsstMask24
+		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
+		hashSymbol := t.hashTab[hashIndex]
+		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
+		maskedWord := word & symbolMask
+
+		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
+			dst[dstPos] = uint8(hashSymbol.code())
+			dstPos++
+			position += int(hashSymbol.length())
+		} else {
+			// Branchless fallback
+			escapeByte := uint8(word)
+			codeU8 := uint8(code)
+			dst[dstPos] = codeU8
+			dstPos++
+			if (code & fsstCodeBase) != 0 {
+				dst[dstPos] = escapeByte
+				dstPos++
+			}
+			position += int(code >> fsstLenBits)
 		}
 	}
 	return dstPos
