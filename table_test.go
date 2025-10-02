@@ -56,7 +56,7 @@ func TestRebuildTableRoundtrip(t *testing.T) {
 	if _, err := tbl2.ReadFrom(&buf); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	comp := tbl2.Encode(input)
+	comp := tbl2.EncodeAll(input)
 	got := tbl2.DecodeAll(comp)
 	if !bytes.Equal(got, input) {
 		t.Fatalf("rebuild roundtrip mismatch")
@@ -73,7 +73,7 @@ func TestTableLimits(t *testing.T) {
 
 	tbl := Train(inputs)
 	// Verify it still works
-	comp := tbl.Encode(inputs[0])
+	comp := tbl.EncodeAll(inputs[0])
 	got := tbl.DecodeAll(comp)
 	if !bytes.Equal(got, inputs[0]) {
 		t.Fatalf("roundtrip failed with many symbols")
@@ -84,7 +84,7 @@ func TestTableLimits(t *testing.T) {
 func TestDecodeAPIs(t *testing.T) {
 	input := []byte("Hello, World! This is a test message for FSST compression.")
 	tbl := Train([][]byte{input})
-	comp := tbl.Encode(input)
+	comp := tbl.EncodeAll(input)
 
 	// Test DecodeAll
 	t.Run("DecodeAll", func(t *testing.T) {
@@ -146,7 +146,7 @@ func BenchmarkDecode(b *testing.B) {
 
 	for _, input := range inputs {
 		tbl := Train([][]byte{input.data})
-		comp := tbl.Encode(input.data)
+		comp := tbl.EncodeAll(input.data)
 
 		b.Run(input.name+"/DecodeAll", func(b *testing.B) {
 			b.SetBytes(int64(len(input.data)))

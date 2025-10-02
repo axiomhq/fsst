@@ -5,6 +5,7 @@ package fsst
 // Memory layout optimizes for space (512 codes × 5 training rounds = lots of counting):
 //   - Single-symbol counts: split into high/low bytes (16-bit range: 0-65535)
 //   - Pair counts: nibble-packed high byte (4-bit) + full low byte (12-bit range: 0-4095)
+//   - Sparse pair tracking: list of [code1, code2] pairs with non-zero counts for fast iteration
 //
 // The "early increment" trick: we increment the high byte when low byte wraps from 255→0,
 // but this happens one cycle early (at 0→1 transition). The getNext methods compensate
@@ -16,6 +17,7 @@ type counters struct {
 	singleLow  [fsstCodeMax]uint8                  // Low byte of single-symbol counts
 	pairHigh   [fsstCodeMax][fsstCodeMax / 2]uint8 // High nibble of pair counts (packed)
 	pairLow    [fsstCodeMax][fsstCodeMax]uint8     // Low byte of pair counts
+	pairList   [][2]uint32                         // Sparse list of non-zero pairs [code1, code2]
 }
 
 // incSingle increments the frequency count for a single symbol.
@@ -37,6 +39,8 @@ func (c *counters) incPair(code1, code2 uint32) {
 		byteIndex := code2 >> 1         // Which byte in the packed array
 		nibbleShift := (code2 & 1) << 2 // 0 or 4 (low/high nibble)
 		c.pairHigh[code1][byteIndex] += 1 << nibbleShift
+		// Track this pair for fast iteration
+		c.pairList = append(c.pairList, [2]uint32{code1, code2})
 	}
 	c.pairLow[code1][code2]++
 }

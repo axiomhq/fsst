@@ -430,8 +430,10 @@ func (t *Table) rebuildIndices() {
 	t.accelReady = true
 }
 
-// Encode compresses a byte slice and returns a new compressed slice.
-func (t *Table) Encode(input []byte) []byte {
+// Encode compresses input, optionally reusing buf for output.
+// buf can be nil or undersized; it will be grown as needed.
+// Returns the compressed data (may have different backing array than buf).
+func (t *Table) Encode(buf, input []byte) []byte {
 	// Lazy-initialize encoder structures
 	if t.encBuf == nil {
 		if !t.accelReady {
@@ -441,23 +443,38 @@ func (t *Table) Encode(input []byte) []byte {
 		t.encBuf = make([]byte, fsstChunkSize+fsstChunkPadding)
 	}
 
-	out := make([]byte, 0, 2*len(input)+fsstOutputPadding)
-	buf := t.encBuf
+	if buf == nil {
+		buf = make([]byte, 2*len(input)+fsstOutputPadding)
+	} else if cap(buf) < 2*len(input)+fsstOutputPadding {
+		buf = make([]byte, 2*len(input)+fsstOutputPadding)
+	} else {
+		buf = buf[:cap(buf)]
+	}
+
+	outPos := 0
+	chunkBuf := t.encBuf
 	byteLim := uint8(t.nSymbols) - uint8(t.lenHisto[0])
 
 	// Process input in chunks for cache efficiency
 	for chunkStart := 0; chunkStart < len(input); {
 		chunk := min(len(input)-chunkStart, fsstChunkSize)
-		copy(buf[:chunk], input[chunkStart:chunkStart+chunk])
-		buf[chunk] = 0 // Zero terminator + padding for unaligned loads
-		out = t.encodeChunk(out, buf, chunk, byteLim)
+		copy(chunkBuf[:chunk], input[chunkStart:chunkStart+chunk])
+		chunkBuf[chunk] = 0 // Zero terminator + padding for unaligned loads
+		outPos = t.encodeChunk(buf, outPos, chunkBuf, chunk, byteLim)
 		chunkStart += chunk
 	}
-	return out
+	return buf[:outPos]
 }
 
-// encodeChunk compresses a single chunk and appends output codes to dst.
+// EncodeAll compresses input and returns a newly allocated byte slice.
+func (t *Table) EncodeAll(input []byte) []byte {
+	return t.Encode(nil, input)
+}
+
+// encodeChunk compresses a single chunk using index-based writes.
+// dst is the output buffer, dstPos is the starting write position.
 // buf must have at least 8 bytes of padding after end for safe unaligned loads.
+// Returns the new output position.
 //
 // Match order (fastest first):
 // 1) Optional fast 2-byte unique-prefix path (when noSuffixOpt is true)
@@ -468,7 +485,7 @@ func (t *Table) Encode(input []byte) []byte {
 // Strategy flags:
 // - noSuffixOpt: skip suffix checking for most 2-byte symbols (higher hit rate)
 // - avoidBranch: use branchless emission when distribution makes branches costly
-func (t *Table) encodeChunk(dst, buf []byte, end int, byteLim uint8) []byte {
+func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int, byteLim uint8) int {
 	position := 0
 
 	for position < end {
@@ -477,7 +494,8 @@ func (t *Table) encodeChunk(dst, buf []byte, end int, byteLim uint8) []byte {
 
 		// Fast path: 2-byte code without suffix check
 		if t.noSuffixOpt && uint8(code) < uint8(t.suffixLim) {
-			dst = append(dst, uint8(code))
+			dst[dstPos] = uint8(code)
+			dstPos++
 			position += 2
 			continue
 		}
@@ -495,35 +513,41 @@ func (t *Table) encodeChunk(dst, buf []byte, end int, byteLim uint8) []byte {
 
 		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord {
 			// Hash table hit: 3+ byte symbol match
-			dst = append(dst, uint8(hashSymbol.code()))
+			dst[dstPos] = uint8(hashSymbol.code())
+			dstPos++
 			position += int(hashSymbol.length())
 		} else if t.avoidBranch {
 			// Branchless path: emit code and conditional escape
 			// code format: [length:4 bits][code:12 bits]
 			// Extract length to advance position
 			outputCode := uint8(code)
-			dst = append(dst, outputCode)
+			dst[dstPos] = outputCode
+			dstPos++
 			// If code >= 256, it's an escape marker (emit literal byte)
 			if (code & fsstCodeBase) != 0 {
-				dst = append(dst, escapeByte)
+				dst[dstPos] = escapeByte
+				dstPos++
 			}
 			position += int(code >> fsstLenBits) // Extract length field
 		} else if uint8(code) < byteLim {
 			// 2-byte code (after checking for longer match)
-			dst = append(dst, uint8(code))
+			dst[dstPos] = uint8(code)
+			dstPos++
 			position += 2
 		} else {
 			// 1-byte code or escape
 			outputCode := uint8(code)
-			dst = append(dst, outputCode)
+			dst[dstPos] = outputCode
+			dstPos++
 			// If code >= 256, it's an escape marker (emit literal byte)
 			if (code & fsstCodeBase) != 0 {
-				dst = append(dst, escapeByte)
+				dst[dstPos] = escapeByte
+				dstPos++
 			}
 			position++
 		}
 	}
-	return dst
+	return dstPos
 }
 
 // Decode decompresses src, optionally reusing buf for output.
@@ -548,22 +572,30 @@ func (t *Table) Decode(buf, src []byte) []byte {
 
 	bufPos := 0
 	srcPos := 0
+	bufCap := cap(buf)
+
+	// Extend to max capacity upfront to reduce slice bound checks
+	if bufCap > 0 {
+		buf = buf[:bufCap]
+	}
 
 	for srcPos < len(src) {
 		code := src[srcPos]
 		srcPos++
+
 		if code < fsstEscapeCode {
 			// Decode learned symbol
 			symbolLength := int(t.decLen[code])
 			symbolValue := t.decSymbol[code]
 
-			// Grow buffer if needed using append
-			if bufPos+symbolLength > cap(buf) {
-				newBuf := make([]byte, bufPos, max(cap(buf)*2, bufPos+symbolLength))
-				copy(newBuf, buf)
+			// Grow buffer if needed
+			if bufPos+symbolLength > bufCap {
+				newCap := max(bufCap*2, bufPos+symbolLength)
+				newBuf := make([]byte, newCap)
+				copy(newBuf, buf[:bufPos])
 				buf = newBuf
+				bufCap = newCap
 			}
-			buf = buf[:bufPos+symbolLength]
 
 			// Direct write: unrolled for common lengths
 			switch symbolLength {
@@ -595,18 +627,19 @@ func (t *Table) Decode(buf, src []byte) []byte {
 			if srcPos >= len(src) {
 				break
 			}
-			if bufPos >= cap(buf) {
-				newBuf := make([]byte, bufPos, max(cap(buf)*2, bufPos+1))
-				copy(newBuf, buf)
+			if bufPos >= bufCap {
+				newCap := max(bufCap*2, bufPos+1)
+				newBuf := make([]byte, newCap)
+				copy(newBuf, buf[:bufPos])
 				buf = newBuf
+				bufCap = newCap
 			}
-			buf = buf[:bufPos+1]
 			buf[bufPos] = src[srcPos]
 			bufPos++
 			srcPos++
 		}
 	}
-	return buf
+	return buf[:bufPos]
 }
 
 // DecodeAll decompresses src and returns a newly allocated byte slice with the result.

@@ -40,7 +40,7 @@ func TestTrainEncodeDecode(t *testing.T) {
 	}
 	tbl := Train(inputs)
 	for i := range inputs {
-		comp := tbl.Encode(inputs[i])
+		comp := tbl.EncodeAll(inputs[i])
 		got := tbl.DecodeAll(comp)
 		if string(got) != string(inputs[i]) {
 			t.Fatalf("roundtrip mismatch: %q != %q", got, inputs[i])
@@ -55,9 +55,9 @@ func TestEqualStringsCompressEqual(t *testing.T) {
 		[]byte("repeat-me-1234567890"),
 	}
 	tbl := Train(inputs)
-	comp0 := tbl.Encode(inputs[0])
-	comp1 := tbl.Encode(inputs[1])
-	comp2 := tbl.Encode(inputs[2])
+	comp0 := tbl.EncodeAll(inputs[0])
+	comp1 := tbl.EncodeAll(inputs[1])
+	comp2 := tbl.EncodeAll(inputs[2])
 	if !bytes.Equal(comp0, comp1) || !bytes.Equal(comp1, comp2) {
 		t.Fatalf("equal strings did not compress to equal outputs")
 	}
@@ -75,7 +75,7 @@ func TestTwoByteAndLongSymbolCompression(t *testing.T) {
 	inputs := [][]byte{mix}
 
 	tbl := Train(inputs)
-	comp := tbl.Encode(inputs[0])
+	comp := tbl.EncodeAll(inputs[0])
 	if len(comp) >= len(inputs[0]) {
 		t.Fatalf("expected some compression, got %d >= %d", len(comp), len(inputs[0]))
 	}
@@ -98,7 +98,7 @@ func TestChunkBoundariesRoundtrip(t *testing.T) {
 	}
 	tbl := Train(inputs)
 	for i := range inputs {
-		comp := tbl.Encode(inputs[i])
+		comp := tbl.EncodeAll(inputs[i])
 		got := tbl.DecodeAll(comp)
 		if !bytes.Equal(got, inputs[i]) {
 			t.Fatalf("roundtrip mismatch at size %d", sizes[i])
@@ -109,7 +109,7 @@ func TestChunkBoundariesRoundtrip(t *testing.T) {
 func TestTrainOnEmpty(t *testing.T) {
 	tbl := Train(nil)
 	input := []byte("the quick brown fox jumped over the lazy dog")
-	comp := tbl.Encode(input)
+	comp := tbl.EncodeAll(input)
 	got := tbl.DecodeAll(comp)
 	if !bytes.Equal(got, input) {
 		t.Fatalf("roundtrip mismatch on empty-trained table")
@@ -120,7 +120,7 @@ func TestZerosRoundtrip(t *testing.T) {
 	training := []byte{0, 1, 2, 3, 4, 0}
 	tbl := Train([][]byte{training})
 	input := []byte{4, 0}
-	comp := tbl.Encode(input)
+	comp := tbl.EncodeAll(input)
 	got := tbl.DecodeAll(comp)
 	if !bytes.Equal(got, input) {
 		t.Fatalf("zeros roundtrip mismatch: %v != %v", got, input)
@@ -152,7 +152,7 @@ func TestCorpusRoundtrip(t *testing.T) {
 			}
 
 			for i := range lines {
-				comp := tbl.Encode(bLines[i])
+				comp := tbl.EncodeAll(bLines[i])
 				got := tbl.DecodeAll(comp)
 				if !bytes.Equal(got, bLines[i]) {
 					t.Fatalf("roundtrip mismatch for %s", path)
@@ -200,16 +200,16 @@ func BenchmarkCorpusCompressionSuite(b *testing.B) {
 
 			b.Run("compress", func(b *testing.B) {
 				b.ReportAllocs()
-				comp := tbl.Encode(data)
+				comp := tbl.EncodeAll(data)
 				b.SetBytes(int64(len(data)))
 				b.ResetTimer()
 				for b.Loop() {
-					_ = tbl.Encode(data)
+					_ = tbl.EncodeAll(data)
 				}
 				b.ReportMetric(float64(len(comp))/float64(len(data)), "ratio")
 			})
 
-			comp := tbl.Encode(data)
+			comp := tbl.EncodeAll(data)
 
 			b.Run("decompress", func(b *testing.B) {
 				b.ReportAllocs()
@@ -239,7 +239,7 @@ func TestRebuildCompressionDeterminism(t *testing.T) {
 		if err != nil {
 			t.Fatalf("train: %v", err)
 		}
-		comp := tbl.Encode(b)
+		comp := tbl.EncodeAll(b)
 		if err != nil {
 			t.Fatalf("compress: %v", err)
 		}
@@ -253,7 +253,7 @@ func TestRebuildCompressionDeterminism(t *testing.T) {
 			t.Fatalf("read: %v", err)
 		}
 
-		comp2 := tbl2.Encode(b)
+		comp2 := tbl2.EncodeAll(b)
 		if !bytes.Equal(comp, comp2) {
 			t.Fatalf("recompressed output mismatch at line %d", i)
 		}
@@ -283,7 +283,7 @@ func TestTrainStrings(t *testing.T) {
 	}
 
 	for i := range inputs {
-		comp := tbl.Encode(inputs[i])
+		comp := tbl.EncodeAll(inputs[i])
 		got := tbl.DecodeAll(comp)
 		if string(got) != strs[i] {
 			t.Fatalf("TrainStrings roundtrip mismatch: got %q, want %q", got, strs[i])
@@ -313,8 +313,8 @@ func TestMarshalBinary(t *testing.T) {
 
 	// Verify compression is identical
 	for i := range inputs {
-		comp1 := tbl.Encode(inputs[i])
-		comp2 := tbl2.Encode(inputs[i])
+		comp1 := tbl.EncodeAll(inputs[i])
+		comp2 := tbl2.EncodeAll(inputs[i])
 		if !bytes.Equal(comp1, comp2) {
 			t.Fatalf("MarshalBinary roundtrip changed compression for input %d", i)
 		}
@@ -337,7 +337,7 @@ func TestEdgeCases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tbl := Train([][]byte{tt.input})
-			comp := tbl.Encode(tt.input)
+			comp := tbl.EncodeAll(tt.input)
 			got := tbl.DecodeAll(comp)
 
 			if !bytes.Equal(got, tt.input) {
@@ -352,7 +352,7 @@ func TestCompressionRatio(t *testing.T) {
 	// Highly repetitive data should compress
 	repetitive := []byte(strings.Repeat("hello world ", 100))
 	tbl := Train([][]byte{repetitive})
-	comp := tbl.Encode(repetitive)
+	comp := tbl.EncodeAll(repetitive)
 
 	ratio := float64(len(comp)) / float64(len(repetitive))
 	if ratio > 0.9 {
@@ -398,7 +398,7 @@ func FuzzCompressRoundtrip(f *testing.F) {
 
 		// Verify all inputs roundtrip correctly
 		for i := range inputs {
-			comp := tbl.Encode(inputs[i])
+			comp := tbl.EncodeAll(inputs[i])
 			got := tbl.DecodeAll(comp)
 			if !bytes.Equal(got, inputs[i]) {
 				t.Fatalf("roundtrip mismatch for input %d", i)
@@ -415,8 +415,8 @@ func FuzzCompressRoundtrip(f *testing.F) {
 			t.Fatalf("read: %v", err)
 		}
 		for i := range inputs {
-			comp1 := tbl.Encode(inputs[i])
-			comp2 := tbl2.Encode(inputs[i])
+			comp1 := tbl.EncodeAll(inputs[i])
+			comp2 := tbl2.EncodeAll(inputs[i])
 			if !bytes.Equal(comp1, comp2) {
 				t.Fatalf("recompressed output mismatch for input %d", i)
 			}
@@ -431,7 +431,7 @@ func FuzzDecoder(f *testing.F) {
 		lines := strings.Split(string(data), "\n")
 		if len(lines) > 0 {
 			tbl := Train([][]byte{[]byte(lines[0])})
-			comp := tbl.Encode([]byte(lines[0]))
+			comp := tbl.EncodeAll([]byte(lines[0]))
 			f.Add(comp)
 		}
 	}
@@ -456,7 +456,7 @@ func FuzzLargeInputs(f *testing.F) {
 		}
 
 		tbl := Train([][]byte{data})
-		comp := tbl.Encode(data)
+		comp := tbl.EncodeAll(data)
 		got := tbl.DecodeAll(comp)
 
 		if !bytes.Equal(got, data) {

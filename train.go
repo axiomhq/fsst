@@ -24,12 +24,16 @@ func Train(inputs [][]byte) *Table {
 		sample  = makeSample(inputs)
 		table   = newTable()
 		counter = &counters{}
+		// Reuse allocations across iterations
+		candidates = make(map[[2]uint64]qsym, 512)
+		heap      = make(qsymHeap, 0, fsstMaxSymbols+1)
+		list      = make([]qsym, 0, fsstMaxSymbols)
 	)
 
 	for frac := 8; ; frac += 30 {
 		*counter = counters{}
 		compressCount(table, counter, sample, frac)
-		buildCandidates(table, counter, frac)
+		buildCandidates(table, counter, frac, candidates, &heap, &list)
 		if frac >= 128 {
 			break
 		}
@@ -149,8 +153,10 @@ func (h *qsymHeap) Pop() any {
 // buildCandidates creates symbol candidates from current counters. It boosts
 // single bytes, considers merged pairs (except in the last round), scores by
 // gain≈frequency×length, keeps top-K via a min-heap, and updates the Table.
-func buildCandidates(t *Table, c *counters, frac int) {
-	candidates := make(map[[2]uint64]qsym)
+// Reuses provided allocations to reduce GC pressure.
+func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]qsym, h *qsymHeap, list *[]qsym) {
+	// Clear candidates map for reuse (clear() is more efficient than delete loop)
+	clear(candidates)
 	minCount := max((minCountNumerator*frac)/minCountDenominator, 1)
 
 	for code := uint32(0); code < fsstCodeBase+uint32(t.nSymbols); code++ {
@@ -172,14 +178,38 @@ func buildCandidates(t *Table, c *counters, frac int) {
 			candidates[key] = qsym{symbol: sym, gain: gain}
 		}
 
-		if sym.length() == 8 || frac >= 128 {
-			continue
-		}
-		for code2 := uint32(0); code2 < fsstCodeBase+uint32(t.nSymbols); code2++ {
-			count2 := c.nextPair(code, &code2)
-			if count2 == 0 || int(count2) < minCount {
+	}
+
+	// Process pairs using sparse list (much faster than nested iteration)
+	if frac < 128 {
+		for _, pair := range c.pairList {
+			code := pair[0]
+			code2 := pair[1]
+
+			// Get count directly from arrays
+			byteIndex := code2 >> 1
+			nibbleShift := (code2 & 1) << 2
+			highNibble := (c.pairHigh[code][byteIndex] >> nibbleShift) & 0xF
+			low := c.pairLow[code][code2]
+
+			if highNibble == 0 && low == 0 {
 				continue
 			}
+
+			count2 := uint32(highNibble)<<8 + uint32(low)
+			if low != 0 && highNibble > 0 {
+				count2 -= 256 // Compensate for early increment
+			}
+
+			if int(count2) < minCount {
+				continue
+			}
+
+			sym := t.symbols[code]
+			if sym.length() == 8 {
+				continue
+			}
+
 			sym2 := t.symbols[code2]
 			merged := fsstConcat(sym, sym2)
 			key := [2]uint64{merged.val, uint64(merged.length())}
@@ -193,34 +223,39 @@ func buildCandidates(t *Table, c *counters, frac int) {
 
 	// Use min-heap to efficiently select top fsstMaxSymbols candidates
 	// This is O(n log k) instead of O(n log n) where k=255, n=candidates
-	h := make(qsymHeap, 0, fsstMaxSymbols+1)
-	heap.Init(&h)
+	*h = (*h)[:0] // Reuse heap, clear contents
+	heap.Init(h)
 
 	for _, candidate := range candidates {
-		if len(h) < fsstMaxSymbols {
-			heap.Push(&h, candidate)
-		} else if candidate.gain > h[0].gain ||
-			(candidate.gain == h[0].gain && candidate.symbol.val < h[0].symbol.val) {
+		if len(*h) < fsstMaxSymbols {
+			heap.Push(h, candidate)
+		} else if candidate.gain > (*h)[0].gain ||
+			(candidate.gain == (*h)[0].gain && candidate.symbol.val < (*h)[0].symbol.val) {
 			// Replace minimum with this better candidate
-			heap.Pop(&h)
-			heap.Push(&h, candidate)
+			heap.Pop(h)
+			heap.Push(h, candidate)
 		}
 	}
 
 	// Extract and sort the top-K (small enough to sort efficiently)
-	list := make([]qsym, len(h))
-	for i := len(h) - 1; i >= 0; i-- {
-		list[i] = heap.Pop(&h).(qsym)
+	*list = (*list)[:0] // Reuse list, clear contents
+	if cap(*list) < len(*h) {
+		*list = make([]qsym, len(*h))
+	} else {
+		*list = (*list)[:len(*h)]
+	}
+	for i := len(*h) - 1; i >= 0; i-- {
+		(*list)[i] = heap.Pop(h).(qsym)
 	}
 
 	// Reverse to get descending order (heap gave us ascending)
-	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
-		list[i], list[j] = list[j], list[i]
+	for i, j := 0, len(*list)-1; i < j; i, j = i+1, j-1 {
+		(*list)[i], (*list)[j] = (*list)[j], (*list)[i]
 	}
 
 	t.clearSymbols()
-	for i := 0; i < len(list) && int(t.nSymbols) < fsstMaxSymbols; i++ {
-		t.addSymbol(list[i].symbol)
+	for i := 0; i < len(*list) && int(t.nSymbols) < fsstMaxSymbols; i++ {
+		t.addSymbol((*list)[i].symbol)
 	}
 }
 
