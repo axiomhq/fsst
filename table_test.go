@@ -96,34 +96,28 @@ func TestDecodeAPIs(t *testing.T) {
 
 	// Test Decode with sufficient buffer
 	t.Run("Decode_sufficient", func(t *testing.T) {
-		dst := make([]byte, len(input)*2) // Generous buffer
-		n := tbl.Decode(dst, comp)
-		if !bytes.Equal(dst[:n], input) {
-			t.Fatalf("Decode mismatch: got %q, want %q", dst[:n], input)
+		buf := make([]byte, len(input)*2) // Generous buffer
+		got := tbl.Decode(buf, comp)
+		if !bytes.Equal(got, input) {
+			t.Fatalf("Decode mismatch: got %q, want %q", got, input)
 		}
 	})
 
-	// Test Decode with exact buffer
-	t.Run("Decode_exact", func(t *testing.T) {
-		dst := make([]byte, len(input))
-		n := tbl.Decode(dst, comp)
-		if n != len(input) {
-			t.Fatalf("Decode returned %d bytes, want %d", n, len(input))
-		}
-		if !bytes.Equal(dst[:n], input) {
-			t.Fatalf("Decode mismatch")
+	// Test Decode with small buffer (should grow)
+	t.Run("Decode_small", func(t *testing.T) {
+		buf := make([]byte, 5) // Too small
+		got := tbl.Decode(buf, comp)
+		if !bytes.Equal(got, input) {
+			t.Fatalf("Decode mismatch: got %q, want %q", got, input)
 		}
 	})
 
-	// Test Decode with too-small buffer (should panic)
-	t.Run("Decode_panic", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Fatalf("Decode should panic with small buffer")
-			}
-		}()
-		dst := make([]byte, 5) // Too small
-		tbl.Decode(dst, comp)
+	// Test Decode with nil buffer (should allocate)
+	t.Run("Decode_nil", func(t *testing.T) {
+		got := tbl.Decode(nil, comp)
+		if !bytes.Equal(got, input) {
+			t.Fatalf("Decode mismatch: got %q, want %q", got, input)
+		}
 	})
 
 	// Test DecodeString
@@ -134,4 +128,62 @@ func TestDecodeAPIs(t *testing.T) {
 			t.Fatalf("DecodeString mismatch: got %q, want %q", got, input)
 		}
 	})
+
+}
+
+// BenchmarkDecode benchmarks different decode scenarios
+func BenchmarkDecode(b *testing.B) {
+	inputs := []struct {
+		name string
+		data []byte
+	}{
+		{"small_100B", bytes.Repeat([]byte("hello world "), 8)},
+		{"medium_1KB", bytes.Repeat([]byte("The quick brown fox jumps over the lazy dog. "), 22)},
+		{"large_10KB", bytes.Repeat([]byte("FSST compression algorithm for structured text data. "), 192)},
+		{"json_like", bytes.Repeat([]byte(`{"name":"John","age":30,"city":"New York","active":true}`), 10)},
+		{"repetitive", bytes.Repeat([]byte("aaaaaaaaaa"), 100)},
+	}
+
+	for _, input := range inputs {
+		tbl := Train([][]byte{input.data})
+		comp := tbl.Encode(input.data)
+
+		b.Run(input.name+"/DecodeAll", func(b *testing.B) {
+			b.SetBytes(int64(len(input.data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = tbl.DecodeAll(comp)
+			}
+		})
+
+		b.Run(input.name+"/Decode_with_buf", func(b *testing.B) {
+			buf := make([]byte, len(input.data)*2)
+			b.SetBytes(int64(len(input.data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = tbl.Decode(buf, comp)
+			}
+		})
+
+		b.Run(input.name+"/Decode_nil", func(b *testing.B) {
+			b.SetBytes(int64(len(input.data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = tbl.Decode(nil, comp)
+			}
+		})
+
+		b.Run(input.name+"/DecodeString", func(b *testing.B) {
+			compStr := string(comp)
+			b.SetBytes(int64(len(input.data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = tbl.DecodeString(compStr)
+			}
+		})
+	}
 }

@@ -526,10 +526,10 @@ func (t *Table) encodeChunk(dst, buf []byte, end int, byteLim uint8) []byte {
 	return dst
 }
 
-// Decode decompresses src into dst and returns the number of bytes written.
-// It panics if dst is not large enough to hold the decompressed output.
-// For unknown output sizes, use DecodeAll which allocates.
-func (t *Table) Decode(dst, src []byte) int {
+// Decode decompresses src, optionally reusing buf for output.
+// buf can be nil or undersized; it will be grown as needed.
+// Returns the decompressed data (may have different backing array than buf).
+func (t *Table) Decode(buf, src []byte) []byte {
 	// Lazy-initialize decoder structures
 	if !t.decReady {
 		for code := uint16(0); code < t.nSymbols; code++ {
@@ -540,11 +540,14 @@ func (t *Table) Decode(dst, src []byte) int {
 		t.decReady = true
 	}
 
-	var (
-		buf    [8]byte
-		dstPos = 0
-		srcPos = 0
-	)
+	if buf == nil {
+		buf = make([]byte, 0, len(src)*4+8)
+	} else {
+		buf = buf[:0] // Reset length but keep capacity
+	}
+
+	bufPos := 0
+	srcPos := 0
 
 	for srcPos < len(src) {
 		code := src[srcPos]
@@ -554,83 +557,66 @@ func (t *Table) Decode(dst, src []byte) int {
 			symbolLength := int(t.decLen[code])
 			symbolValue := t.decSymbol[code]
 
-			// Check buffer space
-			if dstPos+symbolLength > len(dst) {
-				panic("fsst: decode buffer too small")
+			// Grow buffer if needed using append
+			if bufPos+symbolLength > cap(buf) {
+				newBuf := make([]byte, bufPos, max(cap(buf)*2, bufPos+symbolLength))
+				copy(newBuf, buf)
+				buf = newBuf
 			}
+			buf = buf[:bufPos+symbolLength]
 
-			// Batch write: use PutUint64 + copy
-			binary.LittleEndian.PutUint64(buf[:], symbolValue)
-			copy(dst[dstPos:dstPos+symbolLength], buf[:symbolLength])
-			dstPos += symbolLength
+			// Direct write: unrolled for common lengths
+			switch symbolLength {
+			case 1:
+				buf[bufPos] = byte(symbolValue)
+			case 2:
+				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symbolValue))
+			case 3:
+				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symbolValue))
+				buf[bufPos+2] = byte(symbolValue >> 16)
+			case 4:
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
+			case 5:
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
+				buf[bufPos+4] = byte(symbolValue >> 32)
+			case 6:
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
+				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symbolValue>>32))
+			case 7:
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
+				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symbolValue>>32))
+				buf[bufPos+6] = byte(symbolValue >> 48)
+			case 8:
+				binary.LittleEndian.PutUint64(buf[bufPos:], symbolValue)
+			}
+			bufPos += symbolLength
 		} else {
 			// Escape code: next byte is literal
 			if srcPos >= len(src) {
 				break
 			}
-			if dstPos >= len(dst) {
-				panic("fsst: decode buffer too small")
+			if bufPos >= cap(buf) {
+				newBuf := make([]byte, bufPos, max(cap(buf)*2, bufPos+1))
+				copy(newBuf, buf)
+				buf = newBuf
 			}
-			dst[dstPos] = src[srcPos]
-			dstPos++
+			buf = buf[:bufPos+1]
+			buf[bufPos] = src[srcPos]
+			bufPos++
 			srcPos++
 		}
 	}
-	return dstPos
+	return buf
 }
 
 // DecodeAll decompresses src and returns a newly allocated byte slice with the result.
 func (t *Table) DecodeAll(src []byte) []byte {
-	// Pre-allocate with generous capacity (4x input + padding)
-	dst := make([]byte, 0, len(src)*4+8)
-	return t.decodeAppend(dst, src)
+	return t.Decode(nil, src)
 }
 
 // DecodeString decompresses a string and returns a newly allocated byte slice.
 func (t *Table) DecodeString(s string) []byte {
-	return t.DecodeAll(unsafe.Slice(unsafe.StringData(s), len(s)))
-}
-
-// decodeAppend is the internal append-style decoder used by DecodeAll/DecodeString.
-func (t *Table) decodeAppend(dst, src []byte) []byte {
-	// Lazy-initialize decoder structures
-	if !t.decReady {
-		for code := uint16(0); code < t.nSymbols; code++ {
-			sym := t.symbols[code]
-			t.decLen[code] = byte(sym.length())
-			t.decSymbol[code] = sym.val
-		}
-		t.decReady = true
-	}
-
-	var (
-		buf    [8]byte
-		srcPos = 0
-	)
-
-	for srcPos < len(src) {
-		code := src[srcPos]
-		srcPos++
-		if code < fsstEscapeCode {
-			// Decode learned symbol
-			symbolLength := int(t.decLen[code])
-			symbolValue := t.decSymbol[code]
-
-			// Batch write: grow slice once, then copy bytes
-			startIdx := len(dst)
-			dst = append(dst, buf[:symbolLength]...)
-			binary.LittleEndian.PutUint64(buf[:], symbolValue)
-			copy(dst[startIdx:], buf[:symbolLength])
-		} else {
-			// Escape code: next byte is literal
-			if srcPos >= len(src) {
-				break
-			}
-			dst = append(dst, src[srcPos])
-			srcPos++
-		}
-	}
-	return dst
+	return t.Decode(nil, unsafe.Slice(unsafe.StringData(s), len(s)))
 }
 
 // chooseVariant selects the best encoding strategy based on symbol statistics.
