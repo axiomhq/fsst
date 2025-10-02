@@ -18,6 +18,14 @@ type Table struct {
 	symbols    [fsstCodeMax]symbol     // canonical code -> symbol (value+length)
 	hashTab    [fsstHashTabSize]symbol // direct-mapped 3–8B symbols keyed by first 3 bytes
 
+	// Length-specific hash tables for faster encoding (no dynamic masking)
+	hashTab3 [fsstHashTabSize]symbol // 3-byte symbols only
+	hashTab4 [fsstHashTabSize]symbol // 4-byte symbols only
+	hashTab5 [fsstHashTabSize]symbol // 5-byte symbols only
+	hashTab6 [fsstHashTabSize]symbol // 6-byte symbols only
+	hashTab7 [fsstHashTabSize]symbol // 7-byte symbols only
+	hashTab8 [fsstHashTabSize]symbol // 8-byte symbols only
+
 	// Symbol metadata
 	nSymbols  uint16    // number of learned symbols (0..255)
 	suffixLim uint16    // end of unique 2B region [0..suffixLim)
@@ -116,6 +124,54 @@ func (t *Table) hashInsert(sym symbol) bool {
 	mask := ^uint64(0) >> sym.ignoredBits()
 	t.hashTab[hashIndex].val = sym.val & mask
 	return true
+}
+
+// Length-specific hash insert functions (no masking needed, length is known)
+func (t *Table) hashInsert3(sym symbol) {
+	hashIndex := sym.hash() & (fsstHashTabSize - 1)
+	if t.hashTab3[hashIndex].icl >= fsstICLFree {
+		t.hashTab3[hashIndex] = sym
+		t.hashTab3[hashIndex].val = sym.val & 0xFFFFFF
+	}
+}
+
+func (t *Table) hashInsert4(sym symbol) {
+	hashIndex := sym.hash() & (fsstHashTabSize - 1)
+	if t.hashTab4[hashIndex].icl >= fsstICLFree {
+		t.hashTab4[hashIndex] = sym
+		t.hashTab4[hashIndex].val = sym.val & 0xFFFFFFFF
+	}
+}
+
+func (t *Table) hashInsert5(sym symbol) {
+	hashIndex := sym.hash() & (fsstHashTabSize - 1)
+	if t.hashTab5[hashIndex].icl >= fsstICLFree {
+		t.hashTab5[hashIndex] = sym
+		t.hashTab5[hashIndex].val = sym.val & 0xFFFFFFFFFF
+	}
+}
+
+func (t *Table) hashInsert6(sym symbol) {
+	hashIndex := sym.hash() & (fsstHashTabSize - 1)
+	if t.hashTab6[hashIndex].icl >= fsstICLFree {
+		t.hashTab6[hashIndex] = sym
+		t.hashTab6[hashIndex].val = sym.val & 0xFFFFFFFFFFFF
+	}
+}
+
+func (t *Table) hashInsert7(sym symbol) {
+	hashIndex := sym.hash() & (fsstHashTabSize - 1)
+	if t.hashTab7[hashIndex].icl >= fsstICLFree {
+		t.hashTab7[hashIndex] = sym
+		t.hashTab7[hashIndex].val = sym.val & 0xFFFFFFFFFFFFFF
+	}
+}
+
+func (t *Table) hashInsert8(sym symbol) {
+	hashIndex := sym.hash() & (fsstHashTabSize - 1)
+	if t.hashTab8[hashIndex].icl >= fsstICLFree {
+		t.hashTab8[hashIndex] = sym
+	}
 }
 
 // addSymbol assigns a new code to sym and installs it into the appropriate
@@ -387,12 +443,18 @@ func (t *Table) rebuildIndices() {
 	for i := range 256 {
 		t.byteCodes[i] = packCodeLength(fsstCodeMask, 1)
 	}
-	// Clear hash table
+	// Clear hash tables
 	empty := symbol{}
 	empty.val = 0
 	empty.icl = fsstICLFree
 	for i := range fsstHashTabSize {
 		t.hashTab[i] = empty
+		t.hashTab3[i] = empty
+		t.hashTab4[i] = empty
+		t.hashTab5[i] = empty
+		t.hashTab6[i] = empty
+		t.hashTab7[i] = empty
+		t.hashTab8[i] = empty
 	}
 
 	// 2) Apply single-byte symbols to byteCodes
@@ -419,11 +481,29 @@ func (t *Table) rebuildIndices() {
 		}
 	}
 
-	// 5) Insert 3+ byte symbols into hash table
+	// 5) Insert 3+ byte symbols into hash tables
 	for i := range int(t.nSymbols) {
 		sym := t.symbols[i]
-		if sym.length() >= 3 {
-			_ = t.hashInsert(sym)
+		length := sym.length()
+		switch length {
+		case 3:
+			_ = t.hashInsert(sym) // For training
+			t.hashInsert3(sym)
+		case 4:
+			_ = t.hashInsert(sym) // For training
+			t.hashInsert4(sym)
+		case 5:
+			_ = t.hashInsert(sym) // For training
+			t.hashInsert5(sym)
+		case 6:
+			_ = t.hashInsert(sym) // For training
+			t.hashInsert6(sym)
+		case 7:
+			_ = t.hashInsert(sym) // For training
+			t.hashInsert7(sym)
+		case 8:
+			_ = t.hashInsert(sym) // For training
+			t.hashInsert8(sym)
 		}
 	}
 
@@ -452,15 +532,23 @@ func (t *Table) Encode(buf, input []byte) []byte {
 	}
 
 	outPos := 0
-	chunkBuf := t.encBuf
+	inputLen := len(input)
 	byteLim := uint8(t.nSymbols) - uint8(t.lenHisto[0])
 
-	// Process input in chunks for cache efficiency
-	for chunkStart := 0; chunkStart < len(input); {
-		chunk := min(len(input)-chunkStart, fsstChunkSize)
-		copy(chunkBuf[:chunk], input[chunkStart:chunkStart+chunk])
-		outPos = t.encodeChunk(buf, outPos, chunkBuf, chunk, byteLim)
-		chunkStart += chunk
+	// Process input directly: fast path while >=8 bytes remain, then tail
+	position := 0
+	for position+8 <= inputLen {
+		chunkEnd := min(position+fsstChunkSize, inputLen-7)
+		outPos = t.encodeChunk(buf, outPos, input[position:], chunkEnd-position, byteLim)
+		position = chunkEnd
+	}
+
+	// Handle tail (<8 bytes): copy to buffer with padding for safe unaligned loads
+	if position < inputLen {
+		chunkBuf := t.encBuf
+		tailLen := inputLen - position
+		copy(chunkBuf[:tailLen], input[position:])
+		outPos = t.encodeChunk(buf, outPos, chunkBuf, tailLen, byteLim)
 	}
 	return buf[:outPos]
 }
@@ -516,18 +604,31 @@ func (t *Table) encodeChunkBranchedNoSuffix(dst []byte, dstPos int, buf []byte, 
 			continue
 		}
 
-		// Hash table lookup for 3+ byte matches
+		// Length-specific hash table lookup for 3+ byte matches
 		prefix24 := word & fsstMask24
 		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
-		hashSymbol := t.hashTab[hashIndex]
-		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
-		maskedWord := word & symbolMask
-		symbolLen := int(hashSymbol.length())
+		var hashSymbol symbol
+		var found bool
 
-		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord && position+symbolLen <= end {
+		// Probe length-specific tables (8→7→6→5→4→3)
+		if hashSymbol = t.hashTab8[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == word && position+8 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab7[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFFFF) && position+7 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab6[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFF) && position+6 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab5[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFF) && position+5 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab4[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFF) && position+4 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab3[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFF) && position+3 <= end {
+			found = true
+		}
+
+		if found {
 			dst[dstPos] = uint8(hashSymbol.code())
 			dstPos++
-			position += symbolLen
+			position += int(hashSymbol.length())
 		} else {
 			// 1-byte or escape fallback
 			escapeByte := uint8(word)
@@ -569,18 +670,31 @@ func (t *Table) encodeChunkBranched(dst []byte, dstPos int, buf []byte, end int,
 			continue
 		}
 
-		// Hash table lookup for 3+ byte matches
+		// Length-specific hash table lookup for 3+ byte matches
 		prefix24 := word & fsstMask24
 		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
-		hashSymbol := t.hashTab[hashIndex]
-		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
-		maskedWord := word & symbolMask
-		symbolLen := int(hashSymbol.length())
+		var hashSymbol symbol
+		var found bool
 
-		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord && position+symbolLen <= end {
+		// Probe length-specific tables (8→7→6→5→4→3)
+		if hashSymbol = t.hashTab8[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == word && position+8 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab7[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFFFF) && position+7 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab6[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFF) && position+6 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab5[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFF) && position+5 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab4[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFF) && position+4 <= end {
+			found = true
+		} else if hashSymbol = t.hashTab3[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFF) && position+3 <= end {
+			found = true
+		}
+
+		if found {
 			dst[dstPos] = uint8(hashSymbol.code())
 			dstPos++
-			position += symbolLen
+			position += int(hashSymbol.length())
 		} else {
 			// 1-byte or escape fallback
 			escapeByte := uint8(word)
