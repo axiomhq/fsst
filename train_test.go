@@ -464,3 +464,27 @@ func FuzzLargeInputs(f *testing.F) {
 		}
 	})
 }
+
+// BenchmarkTrain benchmarks training with different input sizes
+func BenchmarkTrain(b *testing.B) {
+	inputs := []struct {
+		name string
+		data []byte
+	}{
+		{"small_1KB", []byte("hello world hello there worldwide web ")},
+		{"medium_10KB", make([]byte, 10*1024)},
+	}
+
+	for i := range inputs[1].data {
+		inputs[1].data[i] = byte(i % 256)
+	}
+
+	for _, input := range inputs {
+		b.Run(input.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_ = Train([][]byte{input.data})
+			}
+		})
+	}
+}

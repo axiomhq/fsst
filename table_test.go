@@ -131,6 +131,29 @@ func TestDecodeAPIs(t *testing.T) {
 
 }
 
+// BenchmarkEncode benchmarks different encode APIs
+func BenchmarkEncode(b *testing.B) {
+	input := []byte("hello world hello there worldwide web hello world hello there")
+	tbl := Train([][]byte{input})
+
+	b.Run("EncodeAll", func(b *testing.B) {
+		b.SetBytes(int64(len(input)))
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = tbl.EncodeAll(input)
+		}
+	})
+
+	b.Run("Encode_with_buf", func(b *testing.B) {
+		buf := make([]byte, 2*len(input)+1024)
+		b.SetBytes(int64(len(input)))
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = tbl.Encode(buf, input)
+		}
+	})
+}
+
 // BenchmarkDecode benchmarks different decode scenarios
 func BenchmarkDecode(b *testing.B) {
 	inputs := []struct {

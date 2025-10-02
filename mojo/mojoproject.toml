@@ -1,0 +1,11 @@
+[project]
+authors = ["Seif Lotfy <seif.lotfy@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "https://conda.modular.com/max", "https://repo.prefix.dev/modular-community", "conda-forge"]
+name = "mojo"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+max = ">=25.7.0.dev2025100107,<26"

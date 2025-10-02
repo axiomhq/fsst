@@ -30,3 +30,16 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Mojo build artifacts
+mojo/.magic/
+mojo/*.a
+mojo/*.o
+mojo/magic.lock
+
+
+# pixi environments
+.pixi
+*.egg-info
+# magic environments
+.magic
