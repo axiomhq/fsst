@@ -396,12 +396,25 @@ func FuzzCompressRoundtrip(f *testing.F) {
 		inputs := [][]byte{data1, data2, data3}
 		tbl := Train(inputs)
 
-		// Verify all inputs roundtrip correctly
+		// Verify all inputs roundtrip correctly (Go decoder)
 		for i := range inputs {
 			comp := tbl.EncodeAll(inputs[i])
 			got := tbl.DecodeAll(comp)
 			if !bytes.Equal(got, inputs[i]) {
-				t.Fatalf("roundtrip mismatch for input %d", i)
+				t.Fatalf("Go decoder roundtrip mismatch for input %d", i)
+			}
+		}
+
+		// Verify all inputs roundtrip correctly (SIMD/Mojo decoder)
+		simdDecoder, err := NewSIMDDecoderFromTable(tbl)
+		if err == nil {
+			defer simdDecoder.Close()
+			for i := range inputs {
+				comp := tbl.EncodeAll(inputs[i])
+				got := simdDecoder.Decode(nil, comp)
+				if !bytes.Equal(got, inputs[i]) {
+					t.Fatalf("SIMD decoder roundtrip mismatch for input %d", i)
+				}
 			}
 		}
 
@@ -438,8 +451,15 @@ func FuzzDecoder(f *testing.F) {
 	f.Fuzz(func(t *testing.T, compressedData []byte) {
 		// Create a simple table
 		tbl := Train([][]byte{[]byte("test")})
-		// Should never panic on any compressed data
+		// Should never panic on any compressed data (Go decoder)
 		_ = tbl.DecodeAll(compressedData)
+
+		// Should never panic on any compressed data (SIMD/Mojo decoder)
+		simdDecoder, err := NewSIMDDecoderFromTable(tbl)
+		if err == nil {
+			defer simdDecoder.Close()
+			_ = simdDecoder.Decode(nil, compressedData)
+		}
 	})
 }
 
@@ -457,10 +477,21 @@ func FuzzLargeInputs(f *testing.F) {
 
 		tbl := Train([][]byte{data})
 		comp := tbl.EncodeAll(data)
-		got := tbl.DecodeAll(comp)
 
+		// Test Go decoder
+		got := tbl.DecodeAll(comp)
 		if !bytes.Equal(got, data) {
-			t.Fatalf("large input roundtrip mismatch: len(input)=%d len(got)=%d", len(data), len(got))
+			t.Fatalf("Go decoder large input roundtrip mismatch: len(input)=%d len(got)=%d", len(data), len(got))
+		}
+
+		// Test SIMD/Mojo decoder
+		simdDecoder, err := NewSIMDDecoderFromTable(tbl)
+		if err == nil {
+			defer simdDecoder.Close()
+			simdGot := simdDecoder.Decode(nil, comp)
+			if !bytes.Equal(simdGot, data) {
+				t.Fatalf("SIMD decoder large input roundtrip mismatch: len(input)=%d len(got)=%d", len(data), len(simdGot))
+			}
 		}
 	})
 }

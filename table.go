@@ -613,15 +613,15 @@ func (t *Table) encodeChunkBranchedNoSuffix(dst []byte, dstPos int, buf []byte, 
 		// Probe length-specific tables (8→7→6→5→4→3)
 		if hashSymbol = t.hashTab8[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == word && position+8 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab7[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFFFF) && position+7 <= end {
+		} else if hashSymbol = t.hashTab7[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFFFFFFFFFF) && position+7 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab6[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFF) && position+6 <= end {
+		} else if hashSymbol = t.hashTab6[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFFFFFFFF) && position+6 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab5[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFF) && position+5 <= end {
+		} else if hashSymbol = t.hashTab5[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFFFFFF) && position+5 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab4[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFF) && position+4 <= end {
+		} else if hashSymbol = t.hashTab4[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFFFF) && position+4 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab3[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFF) && position+3 <= end {
+		} else if hashSymbol = t.hashTab3[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFF) && position+3 <= end {
 			found = true
 		}
 
@@ -679,15 +679,15 @@ func (t *Table) encodeChunkBranched(dst []byte, dstPos int, buf []byte, end int,
 		// Probe length-specific tables (8→7→6→5→4→3)
 		if hashSymbol = t.hashTab8[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == word && position+8 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab7[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFFFF) && position+7 <= end {
+		} else if hashSymbol = t.hashTab7[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFFFFFFFFFF) && position+7 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab6[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFF) && position+6 <= end {
+		} else if hashSymbol = t.hashTab6[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFFFFFFFF) && position+6 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab5[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFF) && position+5 <= end {
+		} else if hashSymbol = t.hashTab5[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFFFFFF) && position+5 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab4[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFF) && position+4 <= end {
+		} else if hashSymbol = t.hashTab4[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFFFF) && position+4 <= end {
 			found = true
-		} else if hashSymbol = t.hashTab3[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFF) && position+3 <= end {
+		} else if hashSymbol = t.hashTab3[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word&0xFFFFFF) && position+3 <= end {
 			found = true
 		}
 
@@ -845,50 +845,100 @@ func (t *Table) Decode(buf, src []byte) []byte {
 	}
 
 	for srcPos < len(src) {
+		// First code
 		code := src[srcPos]
 		srcPos++
-
 		if code < fsstEscapeCode {
-			// Decode learned symbol
-			symbolLength := int(t.decLen[code])
-			symbolValue := t.decSymbol[code]
-
-			// Grow buffer if needed
-			if bufPos+symbolLength > bufCap {
-				newCap := max(bufCap*2, bufPos+symbolLength)
+			length := int(t.decLen[code])
+			value := t.decSymbol[code]
+			if bufPos+length > bufCap {
+				newCap := max(bufCap*2, bufPos+length)
 				newBuf := make([]byte, newCap)
 				copy(newBuf, buf[:bufPos])
 				buf = newBuf
 				bufCap = newCap
 			}
-
-			// Direct write: unrolled for common lengths
-			switch symbolLength {
+			switch length {
 			case 1:
-				buf[bufPos] = byte(symbolValue)
+				buf[bufPos] = byte(value)
 			case 2:
-				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symbolValue))
+				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(value))
 			case 3:
-				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symbolValue))
-				buf[bufPos+2] = byte(symbolValue >> 16)
+				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(value))
+				buf[bufPos+2] = byte(value >> 16)
 			case 4:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(value))
 			case 5:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
-				buf[bufPos+4] = byte(symbolValue >> 32)
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(value))
+				buf[bufPos+4] = byte(value >> 32)
 			case 6:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
-				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symbolValue>>32))
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(value))
+				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(value>>32))
 			case 7:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
-				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symbolValue>>32))
-				buf[bufPos+6] = byte(symbolValue >> 48)
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(value))
+				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(value>>32))
+				buf[bufPos+6] = byte(value >> 48)
 			case 8:
-				binary.LittleEndian.PutUint64(buf[bufPos:], symbolValue)
+				binary.LittleEndian.PutUint64(buf[bufPos:], value)
 			}
-			bufPos += symbolLength
+			bufPos += length
 		} else {
-			// Escape code: next byte is literal
+			if srcPos >= len(src) {
+				break
+			}
+			if bufPos >= bufCap {
+				newCap := max(bufCap*2, bufPos+1)
+				newBuf := make([]byte, newCap)
+				copy(newBuf, buf[:bufPos])
+				buf = newBuf
+				bufCap = newCap
+			}
+			buf[bufPos] = src[srcPos]
+			bufPos++
+			srcPos++
+		}
+
+		// Second code (if available)
+		if srcPos >= len(src) {
+			break
+		}
+		code = src[srcPos]
+		srcPos++
+		if code < fsstEscapeCode {
+			length := int(t.decLen[code])
+			value := t.decSymbol[code]
+			if bufPos+length > bufCap {
+				newCap := max(bufCap*2, bufPos+length)
+				newBuf := make([]byte, newCap)
+				copy(newBuf, buf[:bufPos])
+				buf = newBuf
+				bufCap = newCap
+			}
+			switch length {
+			case 1:
+				buf[bufPos] = byte(value)
+			case 2:
+				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(value))
+			case 3:
+				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(value))
+				buf[bufPos+2] = byte(value >> 16)
+			case 4:
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(value))
+			case 5:
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(value))
+				buf[bufPos+4] = byte(value >> 32)
+			case 6:
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(value))
+				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(value>>32))
+			case 7:
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(value))
+				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(value>>32))
+				buf[bufPos+6] = byte(value >> 48)
+			case 8:
+				binary.LittleEndian.PutUint64(buf[bufPos:], value)
+			}
+			bufPos += length
+		} else {
 			if srcPos >= len(src) {
 				break
 			}

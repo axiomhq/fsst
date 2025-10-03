@@ -129,46 +129,52 @@ struct SIMDDecoder:
                 if dst_pos + symbol_len > dst_capacity:
                     return -1
 
-                # Write symbol bytes using direct memory stores (SIMD-friendly)
-                var dst_ptr = dst + dst_pos
-
-                if symbol_len == 1:
-                    dst_ptr[0] = UInt8(symbol_val)
-                elif symbol_len == 2:
-                    # 2-byte store
-                    var ptr16 = dst_ptr.bitcast[UInt16]()
-                    ptr16[0] = UInt16(symbol_val)
-                elif symbol_len == 3:
-                    # 2-byte + 1-byte
-                    var ptr16 = dst_ptr.bitcast[UInt16]()
-                    ptr16[0] = UInt16(symbol_val)
-                    dst_ptr[2] = UInt8(symbol_val >> 16)
-                elif symbol_len == 4:
-                    # 4-byte store
-                    var ptr32 = dst_ptr.bitcast[UInt32]()
-                    ptr32[0] = UInt32(symbol_val)
-                elif symbol_len == 5:
-                    # 4-byte + 1-byte
-                    var ptr32 = dst_ptr.bitcast[UInt32]()
-                    ptr32[0] = UInt32(symbol_val)
-                    dst_ptr[4] = UInt8(symbol_val >> 32)
-                elif symbol_len == 6:
-                    # 4-byte + 2-byte
-                    var ptr32 = dst_ptr.bitcast[UInt32]()
-                    var ptr16 = (dst_ptr + 4).bitcast[UInt16]()
-                    ptr32[0] = UInt32(symbol_val)
-                    ptr16[0] = UInt16(symbol_val >> 32)
-                elif symbol_len == 7:
-                    # 4-byte + 2-byte + 1-byte
-                    var ptr32 = dst_ptr.bitcast[UInt32]()
-                    var ptr16 = (dst_ptr + 4).bitcast[UInt16]()
-                    ptr32[0] = UInt32(symbol_val)
-                    ptr16[0] = UInt16(symbol_val >> 32)
-                    dst_ptr[6] = UInt8(symbol_val >> 48)
-                elif symbol_len == 8:
-                    # 8-byte store (single write)
-                    var ptr64 = dst_ptr.bitcast[UInt64]()
-                    ptr64[0] = symbol_val
+                # SIMD-friendly wide store fast path: store 8 bytes unaligned when safe.
+                # This writes extra bytes beyond symbol_len, which will be overwritten by
+                # subsequent symbols; guarded to never exceed dst_capacity.
+                if dst_pos + 8 <= dst_capacity:
+                    var ptr64_wide = (dst + dst_pos).bitcast[UInt64]()
+                    ptr64_wide[0] = symbol_val
+                else:
+                    # Tail-safe precise stores by exact length
+                    var dst_ptr = dst + dst_pos
+                    if symbol_len == 1:
+                        dst_ptr[0] = UInt8(symbol_val)
+                    elif symbol_len == 2:
+                        # 2-byte store
+                        var ptr16 = dst_ptr.bitcast[UInt16]()
+                        ptr16[0] = UInt16(symbol_val)
+                    elif symbol_len == 3:
+                        # 2-byte + 1-byte
+                        var ptr16 = dst_ptr.bitcast[UInt16]()
+                        ptr16[0] = UInt16(symbol_val)
+                        dst_ptr[2] = UInt8(symbol_val >> 16)
+                    elif symbol_len == 4:
+                        # 4-byte store
+                        var ptr32 = dst_ptr.bitcast[UInt32]()
+                        ptr32[0] = UInt32(symbol_val)
+                    elif symbol_len == 5:
+                        # 4-byte + 1-byte
+                        var ptr32 = dst_ptr.bitcast[UInt32]()
+                        ptr32[0] = UInt32(symbol_val)
+                        dst_ptr[4] = UInt8(symbol_val >> 32)
+                    elif symbol_len == 6:
+                        # 4-byte + 2-byte
+                        var ptr32 = dst_ptr.bitcast[UInt32]()
+                        var ptr16 = (dst_ptr + 4).bitcast[UInt16]()
+                        ptr32[0] = UInt32(symbol_val)
+                        ptr16[0] = UInt16(symbol_val >> 32)
+                    elif symbol_len == 7:
+                        # 4-byte + 2-byte + 1-byte
+                        var ptr32 = dst_ptr.bitcast[UInt32]()
+                        var ptr16 = (dst_ptr + 4).bitcast[UInt16]()
+                        ptr32[0] = UInt32(symbol_val)
+                        ptr16[0] = UInt16(symbol_val >> 32)
+                        dst_ptr[6] = UInt8(symbol_val >> 48)
+                    elif symbol_len == 8:
+                        # 8-byte store (single write)
+                        var ptr64 = dst_ptr.bitcast[UInt64]()
+                        ptr64[0] = symbol_val
 
                 dst_pos += symbol_len
             else:
