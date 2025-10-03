@@ -1,30 +1,28 @@
-from memory import UnsafePointer, memcpy
-from sys import sizeof
+from memory import UnsafePointer
 
 # FSST decoder implementation in Mojo
-# Reads serialized table and owns decoder state
+# Matches C++ reference implementation with scalar branchless decoding
 
 alias FSST_ESCAPE_CODE: UInt8 = 255
 alias FSST_VERSION: UInt64 = 20190218
-alias FSST_CODE_MAX: Int = 512
 
 @register_passable("trivial")
 struct DecoderEntry:
-    """Single decoder table entry: length + symbol in same cache line."""
-    var len: UInt8
-    var symbol: UInt64
+    """
+    Decoder table entry matching C++ Symbol layout.
+    Packed: symbol value (8 bytes) + length (1 byte) in same cache line.
+    """
+    var symbol: UInt64  # symbol value (union of char buf[8] / uint64)
+    var len: UInt8      # symbol length (1-8 bytes)
 
 struct SIMDDecoder:
     """
-    FSST decoder that owns its state.
-    Reads serialized table format from Go's WriteTo() method.
-
-    Data layout optimization: len and symbol are interleaved in a single
-    array for better cache locality (both fetched in one cache line).
+    FSST decoder matching C++ SymbolTable design.
+    Owns decoder state: symbol table loaded from serialized format.
     """
-    var entries: UnsafePointer[DecoderEntry]  # [255] entries with len+symbol
-    var n_symbols: UInt16                      # number of learned symbols
-    var suffix_lim: UInt16                     # end of unique 2B region
+    var entries: UnsafePointer[DecoderEntry]  # [255] decoder entries
+    var n_symbols: UInt16
+    var suffix_lim: UInt16
 
     fn __init__(out self):
         """Initialize empty decoder."""
@@ -38,10 +36,10 @@ struct SIMDDecoder:
 
     fn load_from_bytes(mut self, data: UnsafePointer[UInt8], data_len: Int) -> Bool:
         """
-        Load decoder tables from serialized format.
+        Load decoder from serialized table (Go WriteTo format).
 
-        Format (matches Go's WriteTo):
-        - 8 bytes: version header
+        Format:
+        - 8 bytes: version header (little-endian)
         - 8 bytes: length histogram
         - Variable: symbol bytes
 
@@ -104,140 +102,130 @@ struct SIMDDecoder:
                 symbol_val |= UInt64(data[pos + i]) << (i * 8)
             pos += symbol_len
 
-            # Store in decoder table (interleaved layout)
-            self.entries[code].len = UInt8(symbol_len)
+            # Store in decoder table
             self.entries[code].symbol = symbol_val
+            self.entries[code].len = UInt8(symbol_len)
 
         len_histo.free()
         lens.free()
         return True
 
     @always_inline
-    fn decode_symbol(self, code: UInt8, dst: UnsafePointer[UInt8],
-                     dst_pos: Int, dst_capacity: Int, skip_bounds_check: Bool = False) -> Int:
-        """
-        Decode a single symbol. Returns number of bytes written, or -1 on error.
-        Inlined helper for loop unrolling.
-
-        skip_bounds_check: if True, assumes caller has validated buffer space
-        """
-        # Decode learned symbol (single cache line fetch)
-        var entry = self.entries[Int(code)]
-        var symbol_len = Int(entry.len)
-        var symbol_val = entry.symbol
-
-        # Check buffer capacity (skip if caller pre-validated)
-        if not skip_bounds_check:
-            if dst_pos + symbol_len > dst_capacity:
-                return -1
-
-        # Fast path: always use 8-byte wide store when we have room
-        # (writes beyond symbol_len are OK, will be overwritten by next symbol)
-        var dst_ptr = dst + dst_pos
-        if skip_bounds_check or dst_pos + 8 <= dst_capacity:
-            var ptr64_wide = dst_ptr.bitcast[UInt64]()
-            ptr64_wide[0] = symbol_val
-        else:
-            # Tail region: precise stores by exact length
-            if symbol_len == 1:
-                dst_ptr[0] = UInt8(symbol_val)
-            elif symbol_len == 2:
-                var ptr16 = dst_ptr.bitcast[UInt16]()
-                ptr16[0] = UInt16(symbol_val)
-            elif symbol_len == 3:
-                var ptr16 = dst_ptr.bitcast[UInt16]()
-                ptr16[0] = UInt16(symbol_val)
-                dst_ptr[2] = UInt8(symbol_val >> 16)
-            elif symbol_len == 4:
-                var ptr32 = dst_ptr.bitcast[UInt32]()
-                ptr32[0] = UInt32(symbol_val)
-            elif symbol_len == 5:
-                var ptr32 = dst_ptr.bitcast[UInt32]()
-                ptr32[0] = UInt32(symbol_val)
-                dst_ptr[4] = UInt8(symbol_val >> 32)
-            elif symbol_len == 6:
-                var ptr32 = dst_ptr.bitcast[UInt32]()
-                var ptr16 = (dst_ptr + 4).bitcast[UInt16]()
-                ptr32[0] = UInt32(symbol_val)
-                ptr16[0] = UInt16(symbol_val >> 32)
-            elif symbol_len == 7:
-                var ptr32 = dst_ptr.bitcast[UInt32]()
-                var ptr16 = (dst_ptr + 4).bitcast[UInt16]()
-                ptr32[0] = UInt32(symbol_val)
-                ptr16[0] = UInt16(symbol_val >> 32)
-                dst_ptr[6] = UInt8(symbol_val >> 48)
-            elif symbol_len == 8:
-                var ptr64 = dst_ptr.bitcast[UInt64]()
-                ptr64[0] = symbol_val
-
-        return symbol_len
-
     fn decode(self, src: UnsafePointer[UInt8], src_len: Int,
               dst: UnsafePointer[UInt8], dst_capacity: Int) -> Int:
         """
-        Decode FSST-compressed data with 4x loop unrolling.
+        Optimized decoder with C++ reference principles:
+        1. Loop unrolling (4-way) for ILP
+        2. Always 8-byte store when safe (like C++ speculative writes)
+        3. Minimal branching in hot path
 
-        Returns: Number of bytes written to dst, or -1 if dst is too small
+        Returns: Number of bytes written, or -1 on error
         """
         var src_pos: Int = 0
         var dst_pos: Int = 0
 
-        # Main loop: process 4 symbols at a time (unrolled)
-        # Batch check: ensure we have at least 32 bytes in dst (worst case: 4x 8-byte symbols)
+        # Main loop: 4-way unrolled for instruction-level parallelism
+        # Ensures we have 32 bytes dst capacity (4 symbols × 8 bytes max)
         while src_pos + 4 <= src_len and dst_pos + 32 <= dst_capacity:
-
-            # Unroll 1 (skip bounds check - pre-validated 32 bytes available)
+            # Read 4 codes
             var code0 = src[src_pos]
-            if code0 < FSST_ESCAPE_CODE:
-                var len0 = self.decode_symbol(code0, dst, dst_pos, dst_capacity, True)
-                dst_pos += len0
-                src_pos += 1
-            else:
-                # Escape code - fall through to tail loop
+            var code1 = src[src_pos + 1]
+            var code2 = src[src_pos + 2]
+            var code3 = src[src_pos + 3]
+
+            # Check for escape codes (early exit on escape)
+            if code0 >= FSST_ESCAPE_CODE or code1 >= FSST_ESCAPE_CODE or \
+               code2 >= FSST_ESCAPE_CODE or code3 >= FSST_ESCAPE_CODE:
                 break
 
-            # Unroll 2
-            var code1 = src[src_pos]
-            if code1 < FSST_ESCAPE_CODE:
-                var len1 = self.decode_symbol(code1, dst, dst_pos, dst_capacity, True)
-                dst_pos += len1
-                src_pos += 1
-            else:
-                break
+            # All valid codes: parallel table lookups (independent memory ops)
+            var entry0 = self.entries[Int(code0)]
+            var entry1 = self.entries[Int(code1)]
+            var entry2 = self.entries[Int(code2)]
+            var entry3 = self.entries[Int(code3)]
 
-            # Unroll 3
-            var code2 = src[src_pos]
-            if code2 < FSST_ESCAPE_CODE:
-                var len2 = self.decode_symbol(code2, dst, dst_pos, dst_capacity, True)
-                dst_pos += len2
-                src_pos += 1
-            else:
-                break
+            # Compute output positions via prefix sum (breaks dependency chain)
+            var len0 = Int(entry0.len)
+            var len1 = Int(entry1.len)
+            var len2 = Int(entry2.len)
+            var len3 = Int(entry3.len)
 
-            # Unroll 4
-            var code3 = src[src_pos]
-            if code3 < FSST_ESCAPE_CODE:
-                var len3 = self.decode_symbol(code3, dst, dst_pos, dst_capacity, True)
-                dst_pos += len3
-                src_pos += 1
-            else:
-                break
+            var pos0 = dst_pos
+            var pos1 = dst_pos + len0
+            var pos2 = pos1 + len1
+            var pos3 = pos2 + len2
 
-        # Tail loop: handle remaining symbols one at a time
+            # Parallel 8-byte stores (independent, no dependency)
+            # C++ style: always write 8 bytes, overwrite is harmless
+            var ptr0 = (dst + pos0).bitcast[UInt64]()
+            var ptr1 = (dst + pos1).bitcast[UInt64]()
+            var ptr2 = (dst + pos2).bitcast[UInt64]()
+            var ptr3 = (dst + pos3).bitcast[UInt64]()
+
+            ptr0[0] = entry0.symbol
+            ptr1[0] = entry1.symbol
+            ptr2[0] = entry2.symbol
+            ptr3[0] = entry3.symbol
+
+            dst_pos = pos3 + len3
+            src_pos += 4
+
+        # Tail loop: handle remaining symbols
         while src_pos < src_len:
             var code = src[src_pos]
             src_pos += 1
 
             if code < FSST_ESCAPE_CODE:
-                var symbol_len = self.decode_symbol(code, dst, dst_pos, dst_capacity)
-                if symbol_len < 0:
+                var entry = self.entries[Int(code)]
+                var symbol_len = Int(entry.len)
+
+                if dst_pos + symbol_len > dst_capacity:
                     return -1
+
+                # 8-byte store when safe, else precise
+                var dst_ptr = dst + dst_pos
+                if dst_pos + 8 <= dst_capacity:
+                    var ptr64 = dst_ptr.bitcast[UInt64]()
+                    ptr64[0] = entry.symbol
+                else:
+                    # Tail: precise stores
+                    var symbol_val = entry.symbol
+                    if symbol_len == 1:
+                        dst_ptr[0] = UInt8(symbol_val)
+                    elif symbol_len == 2:
+                        var ptr16 = dst_ptr.bitcast[UInt16]()
+                        ptr16[0] = UInt16(symbol_val)
+                    elif symbol_len == 3:
+                        var ptr16 = dst_ptr.bitcast[UInt16]()
+                        ptr16[0] = UInt16(symbol_val)
+                        dst_ptr[2] = UInt8(symbol_val >> 16)
+                    elif symbol_len == 4:
+                        var ptr32 = dst_ptr.bitcast[UInt32]()
+                        ptr32[0] = UInt32(symbol_val)
+                    elif symbol_len == 5:
+                        var ptr32 = dst_ptr.bitcast[UInt32]()
+                        ptr32[0] = UInt32(symbol_val)
+                        dst_ptr[4] = UInt8(symbol_val >> 32)
+                    elif symbol_len == 6:
+                        var ptr32 = dst_ptr.bitcast[UInt32]()
+                        var ptr16 = (dst_ptr + 4).bitcast[UInt16]()
+                        ptr32[0] = UInt32(symbol_val)
+                        ptr16[0] = UInt16(symbol_val >> 32)
+                    elif symbol_len == 7:
+                        var ptr32 = dst_ptr.bitcast[UInt32]()
+                        var ptr16 = (dst_ptr + 4).bitcast[UInt16]()
+                        ptr32[0] = UInt32(symbol_val)
+                        ptr16[0] = UInt16(symbol_val >> 32)
+                        dst_ptr[6] = UInt8(symbol_val >> 48)
+                    elif symbol_len == 8:
+                        var ptr64 = dst_ptr.bitcast[UInt64]()
+                        ptr64[0] = symbol_val
+
                 dst_pos += symbol_len
             else:
-                # Escape code: next byte is literal
+                # Escape: literal byte
                 if src_pos >= src_len:
                     break
-
                 if dst_pos >= dst_capacity:
                     return -1
 
@@ -259,10 +247,9 @@ fn fsst_decoder_create(
     Create decoder from serialized table bytes.
     Returns opaque pointer to decoder, or NULL on error.
     """
-    # Allocate decoder struct
     var decoder_ptr = UnsafePointer[SIMDDecoder].alloc(1)
 
-    # Manually initialize fields (avoid constructor issues with C ABI)
+    # Manually initialize fields
     var entries_ptr = UnsafePointer[DecoderEntry].alloc(255)
 
     decoder_ptr[].entries = entries_ptr
