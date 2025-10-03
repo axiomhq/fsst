@@ -1,7 +1,6 @@
 package fsst
 
 import (
-	"container/heap"
 	"sort"
 	"unsafe"
 )
@@ -27,14 +26,13 @@ func Train(inputs [][]byte) *Table {
 		counter = &counters{}
 		// Reuse allocations across iterations
 		candidates = make(map[[2]uint64]qsym, 512)
-		heap      = make(qsymHeap, 0, fsstMaxSymbols+1)
-		list      = make([]qsym, 0, fsstMaxSymbols)
+		list       = make([]qsym, 0, 512)
 	)
 
 	for frac := 8; ; frac += 30 {
 		*counter = counters{}
 		compressCount(table, counter, sample, frac)
-		buildCandidates(table, counter, frac, candidates, &heap, &list)
+		buildCandidates(table, counter, frac, candidates, &list)
 		if frac >= 128 {
 			break
 		}
@@ -119,43 +117,11 @@ type qsym struct {
 	gain   uint32
 }
 
-// qsymHeap is a min-heap of qsym based on gain (with tiebreak on symbol.val).
-// We use a min-heap to maintain top-K elements efficiently.
-type qsymHeap []qsym
-
-// Len implements heap.Interface and returns the number of elements.
-func (h qsymHeap) Len() int { return len(h) }
-
-// Less implements heap.Interface ordering by ascending gain, breaking ties
-// by larger symbol value to keep selection deterministic.
-func (h qsymHeap) Less(i, j int) bool {
-	// Min-heap: smaller gain at root (or larger val for tiebreak)
-	if h[i].gain != h[j].gain {
-		return h[i].gain < h[j].gain
-	}
-	return h[i].symbol.val > h[j].symbol.val
-}
-
-// Swap implements heap.Interface swap.
-func (h qsymHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-
-// Push implements heap.Interface push.
-func (h *qsymHeap) Push(x any) { *h = append(*h, x.(qsym)) }
-
-// Pop implements heap.Interface pop.
-func (h *qsymHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
-}
-
 // buildCandidates creates symbol candidates from current counters. It boosts
 // single bytes, considers merged pairs (except in the last round), scores by
-// gain≈frequency×length, keeps top-K via a min-heap, and updates the Table.
+// gain≈frequency×length, sorts candidates by descending gain, and updates the Table.
 // Reuses provided allocations to reduce GC pressure.
-func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]qsym, h *qsymHeap, list *[]qsym) {
+func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]qsym, list *[]qsym) {
 	// Clear candidates map for reuse (clear() is more efficient than delete loop)
 	clear(candidates)
 	minCount := max((minCountNumerator*frac)/minCountDenominator, 1)
@@ -222,33 +188,11 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 		}
 	}
 
-	// Use min-heap to efficiently select top fsstMaxSymbols candidates
-	// This is O(n log k) instead of O(n log n) where k=255, n=candidates
-	*h = (*h)[:0] // Reuse heap, clear contents
-	heap.Init(h)
-
+	// Build and sort candidate list (baseline approach)
+	*list = (*list)[:0]
 	for _, candidate := range candidates {
-		if len(*h) < fsstMaxSymbols {
-			heap.Push(h, candidate)
-		} else if candidate.gain > (*h)[0].gain ||
-			(candidate.gain == (*h)[0].gain && candidate.symbol.val < (*h)[0].symbol.val) {
-			// Replace minimum with this better candidate
-			heap.Pop(h)
-			heap.Push(h, candidate)
-		}
+		*list = append(*list, candidate)
 	}
-
-	// Extract heap contents and sort them properly
-	*list = (*list)[:0] // Reuse list, clear contents
-	if cap(*list) < len(*h) {
-		*list = make([]qsym, len(*h))
-	} else {
-		*list = (*list)[:len(*h)]
-	}
-	// Copy heap contents directly (heap doesn't guarantee full ordering)
-	copy(*list, *h)
-
-	// Sort by descending gain, ascending val for tiebreak (matches original algorithm)
 	sort.Slice(*list, func(i, j int) bool {
 		if (*list)[i].gain != (*list)[j].gain {
 			return (*list)[i].gain > (*list)[j].gain
