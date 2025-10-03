@@ -114,24 +114,27 @@ struct SIMDDecoder:
 
     @always_inline
     fn decode_symbol(self, code: UInt8, dst: UnsafePointer[UInt8],
-                     dst_pos: Int, dst_capacity: Int) -> Int:
+                     dst_pos: Int, dst_capacity: Int, skip_bounds_check: Bool = False) -> Int:
         """
         Decode a single symbol. Returns number of bytes written, or -1 on error.
         Inlined helper for loop unrolling.
+
+        skip_bounds_check: if True, assumes caller has validated buffer space
         """
         # Decode learned symbol (single cache line fetch)
         var entry = self.entries[Int(code)]
         var symbol_len = Int(entry.len)
         var symbol_val = entry.symbol
 
-        # Check buffer capacity
-        if dst_pos + symbol_len > dst_capacity:
-            return -1
+        # Check buffer capacity (skip if caller pre-validated)
+        if not skip_bounds_check:
+            if dst_pos + symbol_len > dst_capacity:
+                return -1
 
         # Fast path: always use 8-byte wide store when we have room
         # (writes beyond symbol_len are OK, will be overwritten by next symbol)
         var dst_ptr = dst + dst_pos
-        if dst_pos + 8 <= dst_capacity:
+        if skip_bounds_check or dst_pos + 8 <= dst_capacity:
             var ptr64_wide = dst_ptr.bitcast[UInt64]()
             ptr64_wide[0] = symbol_val
         else:
@@ -180,13 +183,13 @@ struct SIMDDecoder:
         var dst_pos: Int = 0
 
         # Main loop: process 4 symbols at a time (unrolled)
-        while src_pos + 4 <= src_len:
-            # Unroll 1
+        # Batch check: ensure we have at least 32 bytes in dst (worst case: 4x 8-byte symbols)
+        while src_pos + 4 <= src_len and dst_pos + 32 <= dst_capacity:
+
+            # Unroll 1 (skip bounds check - pre-validated 32 bytes available)
             var code0 = src[src_pos]
             if code0 < FSST_ESCAPE_CODE:
-                var len0 = self.decode_symbol(code0, dst, dst_pos, dst_capacity)
-                if len0 < 0:
-                    return -1
+                var len0 = self.decode_symbol(code0, dst, dst_pos, dst_capacity, True)
                 dst_pos += len0
                 src_pos += 1
             else:
@@ -196,9 +199,7 @@ struct SIMDDecoder:
             # Unroll 2
             var code1 = src[src_pos]
             if code1 < FSST_ESCAPE_CODE:
-                var len1 = self.decode_symbol(code1, dst, dst_pos, dst_capacity)
-                if len1 < 0:
-                    return -1
+                var len1 = self.decode_symbol(code1, dst, dst_pos, dst_capacity, True)
                 dst_pos += len1
                 src_pos += 1
             else:
@@ -207,9 +208,7 @@ struct SIMDDecoder:
             # Unroll 3
             var code2 = src[src_pos]
             if code2 < FSST_ESCAPE_CODE:
-                var len2 = self.decode_symbol(code2, dst, dst_pos, dst_capacity)
-                if len2 < 0:
-                    return -1
+                var len2 = self.decode_symbol(code2, dst, dst_pos, dst_capacity, True)
                 dst_pos += len2
                 src_pos += 1
             else:
@@ -218,9 +217,7 @@ struct SIMDDecoder:
             # Unroll 4
             var code3 = src[src_pos]
             if code3 < FSST_ESCAPE_CODE:
-                var len3 = self.decode_symbol(code3, dst, dst_pos, dst_capacity)
-                if len3 < 0:
-                    return -1
+                var len3 = self.decode_symbol(code3, dst, dst_pos, dst_capacity, True)
                 dst_pos += len3
                 src_pos += 1
             else:
