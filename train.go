@@ -2,6 +2,7 @@ package fsst
 
 import (
 	"container/heap"
+	"sort"
 	"unsafe"
 )
 
@@ -237,21 +238,23 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 		}
 	}
 
-	// Extract and sort the top-K (small enough to sort efficiently)
+	// Extract heap contents and sort them properly
 	*list = (*list)[:0] // Reuse list, clear contents
 	if cap(*list) < len(*h) {
 		*list = make([]qsym, len(*h))
 	} else {
 		*list = (*list)[:len(*h)]
 	}
-	for i := len(*h) - 1; i >= 0; i-- {
-		(*list)[i] = heap.Pop(h).(qsym)
-	}
+	// Copy heap contents directly (heap doesn't guarantee full ordering)
+	copy(*list, *h)
 
-	// Reverse to get descending order (heap gave us ascending)
-	for i, j := 0, len(*list)-1; i < j; i, j = i+1, j-1 {
-		(*list)[i], (*list)[j] = (*list)[j], (*list)[i]
-	}
+	// Sort by descending gain, ascending val for tiebreak (matches original algorithm)
+	sort.Slice(*list, func(i, j int) bool {
+		if (*list)[i].gain != (*list)[j].gain {
+			return (*list)[i].gain > (*list)[j].gain
+		}
+		return (*list)[i].symbol.val < (*list)[j].symbol.val
+	})
 
 	t.clearSymbols()
 	for i := 0; i < len(*list) && int(t.nSymbols) < fsstMaxSymbols; i++ {
