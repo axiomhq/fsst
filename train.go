@@ -26,8 +26,8 @@ func Train(inputs [][]byte) *Table {
 		counter = &counters{}
 		// Reuse allocations across iterations
 		candidates = make(map[[2]uint64]qsym, 512)
-		heap      = make(qsymHeap, 0, fsstMaxSymbols+1)
-		list      = make([]qsym, 0, fsstMaxSymbols)
+		heap       = make(qsymHeap, 0, fsstMaxSymbols+1)
+		list       = make([]qsym, 0, fsstMaxSymbols)
 	)
 
 	for frac := 8; ; frac += 30 {
@@ -185,23 +185,9 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 		for _, pair := range c.pairList {
 			code := pair[0]
 			code2 := pair[1]
+			count2 := c.pairCount(code, code2)
 
-			// Get count directly from arrays
-			byteIndex := code2 >> 1
-			nibbleShift := (code2 & 1) << 2
-			highNibble := (c.pairHigh[code][byteIndex] >> nibbleShift) & 0xF
-			low := c.pairLow[code][code2]
-
-			if highNibble == 0 && low == 0 {
-				continue
-			}
-
-			count2 := uint32(highNibble)<<8 + uint32(low)
-			if low != 0 && highNibble > 0 {
-				count2 -= 256 // Compensate for early increment
-			}
-
-			if int(count2) < minCount {
+			if count2 == 0 || int(count2) < minCount {
 				continue
 			}
 
@@ -213,7 +199,7 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 			sym2 := t.symbols[code2]
 			merged := fsstConcat(sym, sym2)
 			key := [2]uint64{merged.val, uint64(merged.length())}
-			gain := uint32(count2) * uint32(merged.length())
+			gain := count2 * uint32(merged.length())
 			if existing, ok := candidates[key]; ok {
 				gain += existing.gain
 			}

@@ -9,183 +9,101 @@ import (
 )
 
 // Table holds a trained symbol table for compression and decompression.
-// A Table is created via Train and can encode or decode byte slices.
-// After training, a Table can be serialized with WriteTo and restored with ReadFrom.
+// Create with Train or TrainStrings; do not use the zero value.
 type Table struct {
-	// Symbol lookup structures (for encoding)
-	shortCodes [65536]uint16           // 2-byte prefix -> [length|code], fast unique 2B path
-	byteCodes  [256]uint16             // 1-byte -> [length|code], single-byte and escape fallback
-	symbols    [fsstCodeMax]symbol     // canonical code -> symbol (value+length)
-	hashTab    [fsstHashTabSize]symbol // direct-mapped 3–8B symbols keyed by first 3 bytes
-
-	// Length-specific hash tables for faster encoding (no dynamic masking)
-	hashTab3 [fsstHashTabSize]symbol // 3-byte symbols only
-	hashTab4 [fsstHashTabSize]symbol // 4-byte symbols only
-	hashTab5 [fsstHashTabSize]symbol // 5-byte symbols only
-	hashTab6 [fsstHashTabSize]symbol // 6-byte symbols only
-	hashTab7 [fsstHashTabSize]symbol // 7-byte symbols only
-	hashTab8 [fsstHashTabSize]symbol // 8-byte symbols only
+	// Symbol lookup structures
+	shortCodes [65536]uint16           // 2-byte prefix -> packed [length|code]
+	byteCodes  [256]uint16             // 1-byte -> packed [length|code]
+	symbols    [fsstCodeMax]symbol     // code -> symbol (for decoding and training)
+	hashTab    [fsstHashTabSize]symbol // direct-mapped 3-8 byte symbols
 
 	// Symbol metadata
-	nSymbols  uint16    // number of learned symbols (0..255)
-	suffixLim uint16    // end of unique 2B region [0..suffixLim)
-	lenHisto  [8]uint16 // histogram of lengths 1..8 at indices 0..7
+	nSymbols  uint16    // number of learned symbols (0-255)
+	suffixLim uint16    // 2-byte symbols with unique prefixes: [0..suffixLim)
+	lenHisto  [8]uint16 // histogram of lengths 1-8
 
-	// Encoder state (lazy-initialized on first Encode)
-	// accelReady: true when shortCodes/byteCodes/hashTab are populated for encoding.
-	//             Rebuilt lazily after deserialization to avoid cost if only decoding.
-	// noSuffixOpt/avoidBranch: encoding strategy flags chosen based on symbol statistics.
-	// encBuf: reusable chunk buffer (fsstChunkSize+fsstChunkPadding bytes) to avoid allocation per call.
-	accelReady  bool   // encoder lookup structures are ready
-	noSuffixOpt bool   // enable 2-byte fast path without suffix check
-	avoidBranch bool   // prefer branchless emission in encodeChunk
-	encBuf      []byte // scratch chunk buffer used by Encode
+	// Decoder tables (built at finalization)
+	decLen    [255]byte   // code -> symbol length
+	decSymbol [255]uint64 // code -> symbol value
 
-	// Decoder state (lazy-initialized on first Decode)
-	// decLen/decSymbol: flattened arrays for fast decoding (indexed by code).
-	//                   Built lazily to avoid cost if only encoding.
-	// decReady: true when decoder arrays are populated.
-	decLen    [255]byte   // code → symbol length
-	decSymbol [255]uint64 // code → symbol value (little-endian)
-	decReady  bool        // decoder lookup tables are ready
+	// Encoder scratch buffer
+	encBuf []byte
 }
 
-// Version is the FSST format version (publication date: February 18, 2019).
 const fsstVersion uint64 = 20190218
 
-// ErrBadVersion indicates the serialized table version is not supported.
 var ErrBadVersion = errors.New("fsst: unsupported table version")
 
-// newTable initializes a new empty table with defaults.
+// newTable creates an initialized empty table.
 func newTable() *Table {
 	t := &Table{}
-	// pseudo symbols 0..255 (escaped bytes)
+	// Codes 0-255 are escape codes for literal bytes
 	for i := range 256 {
 		t.symbols[i] = newSymbolFromByte(byte(i), packCodeLength(uint16(i), 1))
 	}
-	// mark unused
-	unused := newSymbolFromByte(0, fsstCodeMask)
+	// Mark remaining slots unused
+	unused := symbol{val: 0, icl: fsstICLFree}
 	for i := 256; i < fsstCodeMax; i++ {
 		t.symbols[i] = unused
 	}
-	// empty hash table markers
-	emptySymbol := symbol{}
-	emptySymbol.val = 0
-	emptySymbol.icl = fsstICLFree
+	// Empty hash table slots
+	empty := symbol{val: 0, icl: fsstICLFree}
 	for i := range fsstHashTabSize {
-		t.hashTab[i] = emptySymbol
+		t.hashTab[i] = empty
 	}
-	// fill byteCodes with pseudo code (escaped bytes)
+	// byteCodes: each byte escapes to itself
 	for i := range 256 {
 		t.byteCodes[i] = packCodeLength(uint16(i), 1)
 	}
-	// fill shortCodes with pseudo code for first byte
+	// shortCodes: fall back to first byte's code
 	for i := range 65536 {
 		t.shortCodes[i] = packCodeLength(uint16(i&fsstMask8), 1)
 	}
 	return t
 }
 
-// clearSymbols removes all learned symbols from the Table and restores the
-// lookup structures (byteCodes/shortCodes/hashTab) to their default state.
-// It also resets the length histogram and learned symbol count.
+// clearSymbols removes all learned symbols and restores lookup tables to defaults.
 func (t *Table) clearSymbols() {
 	for i := range t.lenHisto {
 		t.lenHisto[i] = 0
 	}
 	for i := fsstCodeBase; i < int(fsstCodeBase)+int(t.nSymbols); i++ {
-		switch t.symbols[i].length() {
+		sym := t.symbols[i]
+		switch sym.length() {
 		case 1:
-			firstByte := t.symbols[i].first()
-			t.byteCodes[firstByte] = packCodeLength(uint16(firstByte), 1)
+			t.byteCodes[sym.first()] = packCodeLength(uint16(sym.first()), 1)
 		case 2:
-			first2Bytes := t.symbols[i].first2()
-			t.shortCodes[first2Bytes] = packCodeLength(uint16(first2Bytes&fsstMask8), 1)
+			t.shortCodes[sym.first2()] = packCodeLength(uint16(sym.first2()&fsstMask8), 1)
 		default:
-			hashIndex := t.symbols[i].hash() & (fsstHashTabSize - 1)
-			t.hashTab[hashIndex].val = 0
-			t.hashTab[hashIndex].icl = fsstICLFree
+			idx := sym.hash() & (fsstHashTabSize - 1)
+			t.hashTab[idx] = symbol{val: 0, icl: fsstICLFree}
 		}
 	}
 	t.nSymbols = 0
 }
 
-// hashInsert inserts a 3+ byte symbol into the direct-mapped hash table.
-// It stores the symbol with masked value (ignore high bytes) and returns
-// false if the target slot is already occupied.
+// hashInsert adds a 3+ byte symbol to the hash table.
+// Returns false if the slot is already occupied.
 func (t *Table) hashInsert(sym symbol) bool {
-	hashIndex := sym.hash() & (fsstHashTabSize - 1)
-	taken := t.hashTab[hashIndex].icl < fsstICLFree
-	if taken {
+	idx := sym.hash() & (fsstHashTabSize - 1)
+	if t.hashTab[idx].icl < fsstICLFree {
 		return false
 	}
-	t.hashTab[hashIndex].icl = sym.icl
-	// mask high ignored bits before storing
+	// Mask off unused high bytes before storing
 	mask := ^uint64(0) >> sym.ignoredBits()
-	t.hashTab[hashIndex].val = sym.val & mask
+	t.hashTab[idx] = symbol{val: sym.val & mask, icl: sym.icl}
 	return true
 }
 
-// Length-specific hash insert functions (no masking needed, length is known)
-func (t *Table) hashInsert3(sym symbol) {
-	hashIndex := sym.hash() & (fsstHashTabSize - 1)
-	if t.hashTab3[hashIndex].icl >= fsstICLFree {
-		t.hashTab3[hashIndex] = sym
-		t.hashTab3[hashIndex].val = sym.val & 0xFFFFFF
-	}
-}
-
-func (t *Table) hashInsert4(sym symbol) {
-	hashIndex := sym.hash() & (fsstHashTabSize - 1)
-	if t.hashTab4[hashIndex].icl >= fsstICLFree {
-		t.hashTab4[hashIndex] = sym
-		t.hashTab4[hashIndex].val = sym.val & 0xFFFFFFFF
-	}
-}
-
-func (t *Table) hashInsert5(sym symbol) {
-	hashIndex := sym.hash() & (fsstHashTabSize - 1)
-	if t.hashTab5[hashIndex].icl >= fsstICLFree {
-		t.hashTab5[hashIndex] = sym
-		t.hashTab5[hashIndex].val = sym.val & 0xFFFFFFFFFF
-	}
-}
-
-func (t *Table) hashInsert6(sym symbol) {
-	hashIndex := sym.hash() & (fsstHashTabSize - 1)
-	if t.hashTab6[hashIndex].icl >= fsstICLFree {
-		t.hashTab6[hashIndex] = sym
-		t.hashTab6[hashIndex].val = sym.val & 0xFFFFFFFFFFFF
-	}
-}
-
-func (t *Table) hashInsert7(sym symbol) {
-	hashIndex := sym.hash() & (fsstHashTabSize - 1)
-	if t.hashTab7[hashIndex].icl >= fsstICLFree {
-		t.hashTab7[hashIndex] = sym
-		t.hashTab7[hashIndex].val = sym.val & 0xFFFFFFFFFFFFFF
-	}
-}
-
-func (t *Table) hashInsert8(sym symbol) {
-	hashIndex := sym.hash() & (fsstHashTabSize - 1)
-	if t.hashTab8[hashIndex].icl >= fsstICLFree {
-		t.hashTab8[hashIndex] = sym
-	}
-}
-
-// addSymbol assigns a new code to sym and installs it into the appropriate
-// lookup structure based on its length:
-//
-//	1 byte -> byteCodes, 2 bytes -> shortCodes, 3–8 bytes -> hashTab.
-//
-// Returns false if capacity is exceeded or hash slot is taken.
+// addSymbol assigns a new code to sym and installs it into the lookup tables.
+// Returns false if capacity exceeded or hash slot taken.
 func (t *Table) addSymbol(sym symbol) bool {
 	if int(fsstCodeBase)+int(t.nSymbols) >= fsstCodeMax {
 		return false
 	}
 	length := sym.length()
 	sym.setCodeLen(uint32(fsstCodeBase)+uint32(t.nSymbols), length)
+
 	switch length {
 	case 1:
 		t.byteCodes[sym.first()] = packCodeLength(uint16(fsstCodeBase+t.nSymbols), 1)
@@ -202,14 +120,14 @@ func (t *Table) addSymbol(sym symbol) bool {
 	return true
 }
 
-// findLongestSymbol decides the longest match at cur represented as a temporary symbol.
+// findLongestSymbol returns the code for the longest matching symbol.
 func (t *Table) findLongestSymbol(sym symbol) uint16 {
-	hashIndex := sym.hash() & (fsstHashTabSize - 1)
-	hashEntry := t.hashTab[hashIndex]
-	if hashEntry.icl <= sym.icl {
-		mask := ^uint64(0) >> uint(hashEntry.ignoredBits())
-		if hashEntry.val == (sym.val & mask) {
-			return (hashEntry.code() & fsstCodeMask)
+	idx := sym.hash() & (fsstHashTabSize - 1)
+	entry := t.hashTab[idx]
+	if entry.icl <= sym.icl {
+		mask := ^uint64(0) >> entry.ignoredBits()
+		if entry.val == (sym.val & mask) {
+			return entry.code() & fsstCodeMask
 		}
 	}
 	if sym.length() >= 2 {
@@ -221,30 +139,16 @@ func (t *Table) findLongestSymbol(sym symbol) uint16 {
 	return t.byteCodes[sym.first()] & fsstCodeMask
 }
 
-// finalize reorders symbol codes by length for encoding efficiency.
-//
-// Code layout after finalization:
-//
-//	[0..byteLim):          1-byte symbols (direct byteCodes lookup)
-//	[byteLim..suffixLim):  2-byte symbols with unique prefixes (fast shortCodes lookup)
-//	[suffixLim..nSymbols): 2-byte symbols with conflicts + 3-8 byte symbols (hash table)
-//
-// This ordering enables the encoder to use faster lookup paths for common cases:
-// - 1-byte symbols decode directly from byteCodes array
-// - 2-byte symbols without prefix conflicts decode from shortCodes without hash check
-// - Remaining symbols (conflicting 2-byte and long symbols) use hash table lookup
-//
-// Effects: updates code assignments in symbols[], sets suffixLim accordingly,
-// preserves lengths, and leaves rebuilding of fast lookup tables to rebuildIndices.
+// finalize reorders codes by length for encoding efficiency and builds decoder tables.
+// Called automatically by Train; users should not call this directly.
 func (t *Table) finalize() {
-	// Precondition: nSymbols <= 255
 	newCode := make([]uint8, 256)
-	var codeStart [8]uint8 // Starting code for each length group (1-8 bytes)
+	var codeStart [8]uint8
 	byteLim := uint8(t.nSymbols) - uint8(t.lenHisto[0])
 
-	// Initialize code ranges: 1-byte symbols get [byteLim, nSymbols)
+	// Layout: [0..byteLim) = 2-byte unique, [byteLim..nSymbols) = 1-byte
 	codeStart[0] = byteLim
-	codeStart[1] = 0 // 2-byte symbols start at 0 (will be partitioned)
+	codeStart[1] = 0
 	for i := 1; i < 7; i++ {
 		codeStart[i+1] = codeStart[i] + uint8(t.lenHisto[i])
 	}
@@ -252,38 +156,32 @@ func (t *Table) finalize() {
 	t.suffixLim = uint16(codeStart[1])
 	t.symbols[newCode[0]] = t.symbols[256]
 
-	// Assign new codes, partitioning 2-byte symbols by prefix uniqueness
-	conflictingTwoByteCode := int(codeStart[2]) // Codes for conflicting 2-byte symbols (count down)
+	// Partition 2-byte symbols by prefix uniqueness
+	conflictCode := int(codeStart[2])
 	for i := range int(t.nSymbols) {
 		sym := t.symbols[int(fsstCodeBase)+i]
 		length := sym.length()
 
 		if length == 2 {
-			// Check if this 2-byte symbol has a unique prefix (no other symbols share first2)
 			hasConflict := false
 			first2 := sym.first2()
 			for k := 0; k < int(t.nSymbols); k++ {
-				if k == i {
-					continue
-				}
-				other := t.symbols[int(fsstCodeBase)+k]
-				if other.length() > 1 && other.first2() == first2 {
-					hasConflict = true
-					break
+				if k != i {
+					other := t.symbols[int(fsstCodeBase)+k]
+					if other.length() > 1 && other.first2() == first2 {
+						hasConflict = true
+						break
+					}
 				}
 			}
-
-			if !hasConflict {
-				// Unique prefix: assign to fast-path range [0..suffixLim)
+			if hasConflict {
+				conflictCode--
+				newCode[i] = uint8(conflictCode)
+			} else {
 				newCode[i] = uint8(t.suffixLim)
 				t.suffixLim++
-			} else {
-				// Conflicting prefix: assign to slow-path range [suffixLim..codeStart[2])
-				conflictingTwoByteCode--
-				newCode[i] = uint8(conflictingTwoByteCode)
 			}
 		} else {
-			// Non-2-byte symbols: assign sequentially within length group
 			lengthIdx := int(length - 1)
 			newCode[i] = codeStart[lengthIdx]
 			codeStart[lengthIdx]++
@@ -292,15 +190,67 @@ func (t *Table) finalize() {
 		sym.setCodeLen(uint32(newCode[i]), length)
 		t.symbols[int(newCode[i])] = sym
 	}
+
+	// Build encoder and decoder lookup tables
+	t.rebuildIndices()
+	t.buildDecoderTables()
+	t.encBuf = make([]byte, fsstChunkSize+fsstChunkPadding)
 }
 
-// WriteTo serializes the finalized Table to w using the compact FSST header format.
-// Layout:
-// - 8 bytes version word: (version<<32)|(suffixLim<<16)|(nSymbols<<8)|1
-// - 8 bytes lenHisto (u8)
-// - concatenated symbol bytes for codes [0..nSymbols) in length-group order
+// rebuildIndices reconstructs byteCodes, shortCodes, and hashTab from symbols.
+func (t *Table) rebuildIndices() {
+	// Reset byteCodes to escape
+	for i := range 256 {
+		t.byteCodes[i] = packCodeLength(fsstCodeMask, 1)
+	}
+
+	// Clear hash table
+	empty := symbol{val: 0, icl: fsstICLFree}
+	for i := range fsstHashTabSize {
+		t.hashTab[i] = empty
+	}
+
+	// Apply 1-byte symbols
+	for i := range int(t.nSymbols) {
+		sym := t.symbols[i]
+		if sym.length() == 1 {
+			t.byteCodes[sym.first()] = packCodeLength(uint16(i), 1)
+		}
+	}
+
+	// shortCodes mirrors byteCodes for first byte
+	for i := range 65536 {
+		t.shortCodes[i] = t.byteCodes[i&fsstMask8]
+	}
+
+	// Apply 2-byte symbols
+	for i := range int(t.nSymbols) {
+		sym := t.symbols[i]
+		if sym.length() == 2 {
+			t.shortCodes[sym.first2()] = packCodeLength(uint16(i), 2)
+		}
+	}
+
+	// Insert 3+ byte symbols into hash table
+	for i := range int(t.nSymbols) {
+		sym := t.symbols[i]
+		if sym.length() >= 3 {
+			t.hashInsert(sym)
+		}
+	}
+}
+
+// buildDecoderTables populates the flat decLen/decSymbol arrays.
+func (t *Table) buildDecoderTables() {
+	for code := uint16(0); code < t.nSymbols; code++ {
+		sym := t.symbols[code]
+		t.decLen[code] = byte(sym.length())
+		t.decSymbol[code] = sym.val
+	}
+}
+
+// WriteTo serializes the Table to w.
 func (t *Table) WriteTo(w io.Writer) (int64, error) {
-	// pack version
 	ver := (fsstVersion << 32) |
 		(uint64(t.suffixLim) << 16) |
 		(uint64(t.nSymbols) << 8) |
@@ -315,11 +265,10 @@ func (t *Table) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		n += int64(nn)
 	}
-	// Write lenHisto derived from symbols to avoid relying on stored state
-	var (
-		lh   [8]byte
-		hist [8]uint16
-	)
+
+	// Write lenHisto
+	var lh [8]byte
+	var hist [8]uint16
 	for i := range int(t.nSymbols) {
 		length := t.symbols[i].length()
 		if length >= 1 && length <= 8 {
@@ -334,7 +283,8 @@ func (t *Table) WriteTo(w io.Writer) (int64, error) {
 	} else {
 		n += int64(nn)
 	}
-	// symbol bytes
+
+	// Write symbol bytes
 	for i := range int(t.nSymbols) {
 		sym := t.symbols[i]
 		symbolLength := int(sym.length())
@@ -350,9 +300,9 @@ func (t *Table) WriteTo(w io.Writer) (int64, error) {
 	return n, nil
 }
 
-// ReadFrom deserializes a Table from r using the compact FSST header format.
+// ReadFrom deserializes a Table from r.
 func (t *Table) ReadFrom(r io.Reader) (int64, error) {
-	*t = *newTable() // reset
+	*t = *newTable()
 	var (
 		n   int64
 		hdr [8]byte
@@ -367,7 +317,7 @@ func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 	}
 	t.suffixLim = uint16((ver >> 16) & fsstMask8)
 	t.nSymbols = uint16((ver >> 8) & fsstMask8)
-	// endian marker ignored (lowest byte)
+
 	var lh [8]byte
 	if _, err := io.ReadFull(r, lh[:]); err != nil {
 		return n, err
@@ -376,25 +326,22 @@ func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 	for i := range 8 {
 		t.lenHisto[i] = uint16(lh[i])
 	}
-	// read symbol bytes into symbols[0..nSymbols)
-	// Build code->length schedule from lenHisto
+
+	// Build length schedule
 	lens := make([]uint8, t.nSymbols)
 	pos := 0
-	// lengths 2..8
 	for l := 2; l <= 8; l++ {
-		cnt := int(t.lenHisto[l-1])
-		for range cnt {
+		for range int(t.lenHisto[l-1]) {
 			lens[pos] = uint8(l)
 			pos++
 		}
 	}
-	// then 1-byte
-	cnt1 := int(t.lenHisto[0])
-	for j := 0; j < cnt1; j++ {
+	for range int(t.lenHisto[0]) {
 		lens[pos] = 1
 		pos++
 	}
-	// now read symbols accordingly
+
+	// Read symbols
 	for i := range int(t.nSymbols) {
 		symbolLength := int(lens[i])
 		var b8 [8]byte
@@ -402,7 +349,6 @@ func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 			return n, err
 		}
 		n += int64(symbolLength)
-		// pack into symbol (little-endian)
 		var symbolValue uint64
 		for byteIdx := range symbolLength {
 			symbolValue |= uint64(b8[byteIdx]) << (8 * byteIdx)
@@ -411,7 +357,10 @@ func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 		sym.setCodeLen(uint32(i), uint32(symbolLength))
 		t.symbols[i] = sym
 	}
-	t.accelReady = false
+
+	t.rebuildIndices()
+	t.buildDecoderTables()
+	t.encBuf = make([]byte, fsstChunkSize+fsstChunkPadding)
 	return n, nil
 }
 
@@ -430,102 +379,10 @@ func (t *Table) UnmarshalBinary(data []byte) error {
 	return err
 }
 
-// rebuildIndices reconstructs byteCodes, shortCodes, and hashTab from the
-// finalized symbols. It preserves existing code assignments (already set in
-// symbols[i]) and only rebuilds the derived lookup structures. Safe to call
-// multiple times; it is a no-op if accelReady is already true.
-func (t *Table) rebuildIndices() {
-	if t.accelReady {
-		return
-	}
-	// 1) Reset to defaults
-	// byteCodes default to ESCAPE (fsstCodeMask) with len=1 marker
-	for i := range 256 {
-		t.byteCodes[i] = packCodeLength(fsstCodeMask, 1)
-	}
-	// Clear hash tables
-	empty := symbol{}
-	empty.val = 0
-	empty.icl = fsstICLFree
-	for i := range fsstHashTabSize {
-		t.hashTab[i] = empty
-		t.hashTab3[i] = empty
-		t.hashTab4[i] = empty
-		t.hashTab5[i] = empty
-		t.hashTab6[i] = empty
-		t.hashTab7[i] = empty
-		t.hashTab8[i] = empty
-	}
-
-	// 2) Apply single-byte symbols to byteCodes
-	for i := range int(t.nSymbols) {
-		sym := t.symbols[i]
-		length := sym.length()
-		if length == 1 {
-			firstByte := sym.first()
-			t.byteCodes[firstByte] = packCodeLength(uint16(i), 1)
-		}
-	}
-
-	// 3) Initialize shortCodes to mirror byteCodes of the first byte
-	for i := range 65536 {
-		first := i & fsstMask8
-		t.shortCodes[i] = t.byteCodes[first]
-	}
-
-	// 4) Apply two-byte symbols to shortCodes
-	for i := range int(t.nSymbols) {
-		sym := t.symbols[i]
-		if sym.length() == 2 {
-			t.shortCodes[sym.first2()] = packCodeLength(uint16(i), 2)
-		}
-	}
-
-	// 5) Insert 3+ byte symbols into hash tables
-	for i := range int(t.nSymbols) {
-		sym := t.symbols[i]
-		length := sym.length()
-		switch length {
-		case 3:
-			_ = t.hashInsert(sym) // For training
-			t.hashInsert3(sym)
-		case 4:
-			_ = t.hashInsert(sym) // For training
-			t.hashInsert4(sym)
-		case 5:
-			_ = t.hashInsert(sym) // For training
-			t.hashInsert5(sym)
-		case 6:
-			_ = t.hashInsert(sym) // For training
-			t.hashInsert6(sym)
-		case 7:
-			_ = t.hashInsert(sym) // For training
-			t.hashInsert7(sym)
-		case 8:
-			_ = t.hashInsert(sym) // For training
-			t.hashInsert8(sym)
-		}
-	}
-
-	t.accelReady = true
-}
-
-// Encode compresses input, optionally reusing buf for output.
-// buf can be nil or undersized; it will be grown as needed.
-// Returns the compressed data (may have different backing array than buf).
+// Encode compresses input, reusing buf if provided.
+// Returns compressed data (may be a different slice than buf).
 func (t *Table) Encode(buf, input []byte) []byte {
-	// Lazy-initialize encoder structures
-	if t.encBuf == nil {
-		if !t.accelReady {
-			t.rebuildIndices()
-		}
-		t.noSuffixOpt, t.avoidBranch = chooseVariant(t)
-		t.encBuf = make([]byte, fsstChunkSize+fsstChunkPadding)
-	}
-
-	if buf == nil {
-		buf = make([]byte, 2*len(input)+fsstOutputPadding)
-	} else if cap(buf) < 2*len(input)+fsstOutputPadding {
+	if buf == nil || cap(buf) < 2*len(input)+fsstOutputPadding {
 		buf = make([]byte, 2*len(input)+fsstOutputPadding)
 	} else {
 		buf = buf[:cap(buf)]
@@ -533,70 +390,40 @@ func (t *Table) Encode(buf, input []byte) []byte {
 
 	outPos := 0
 	inputLen := len(input)
-	byteLim := uint8(t.nSymbols) - uint8(t.lenHisto[0])
-
-	// Process input directly: fast path while >=8 bytes remain, then tail
 	position := 0
+
+	// Process with safe unaligned loads while >=8 bytes remain
 	for position+8 <= inputLen {
 		chunkEnd := min(position+fsstChunkSize, inputLen-7)
-		outPos = t.encodeChunk(buf, outPos, input[position:], chunkEnd-position, byteLim)
+		outPos = t.encodeChunk(buf, outPos, input[position:], chunkEnd-position)
 		position = chunkEnd
 	}
 
-	// Handle tail (<8 bytes): copy to buffer with padding for safe unaligned loads
+	// Handle tail with padded buffer
 	if position < inputLen {
-		chunkBuf := t.encBuf
 		tailLen := inputLen - position
-		copy(chunkBuf[:tailLen], input[position:])
-		outPos = t.encodeChunk(buf, outPos, chunkBuf, tailLen, byteLim)
+		copy(t.encBuf[:tailLen], input[position:])
+		outPos = t.encodeChunk(buf, outPos, t.encBuf, tailLen)
 	}
 	return buf[:outPos]
 }
 
-// EncodeAll compresses input and returns a newly allocated byte slice.
+// EncodeAll compresses input and returns a newly allocated slice.
 func (t *Table) EncodeAll(input []byte) []byte {
 	return t.Encode(nil, input)
 }
 
-// encodeChunk compresses a single chunk using index-based writes.
-// dst is the output buffer, dstPos is the starting write position.
-// buf must have at least 8 bytes of padding after end for safe unaligned loads.
-// Returns the new output position.
-//
-// Match order (fastest first):
-// 1) Optional fast 2-byte unique-prefix path (when noSuffixOpt is true)
-// 2) 3–8 byte hash-table match (longest available)
-// 3) 2-byte short-code path (when within suffixLim)
-// 4) 1-byte or escape fallback
-//
-// Strategy flags:
-// - noSuffixOpt: skip suffix checking for most 2-byte symbols (higher hit rate)
-// - avoidBranch: use branchless emission when distribution makes branches costly
-func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int, byteLim uint8) int {
-	// Hoist strategy checks outside hot loop to eliminate redundant field access
-	if t.avoidBranch {
-		if t.noSuffixOpt {
-			return t.encodeChunkBranchlessNoSuffix(dst, dstPos, buf, end)
-		}
-		return t.encodeChunkBranchless(dst, dstPos, buf, end, byteLim)
-	}
-	if t.noSuffixOpt {
-		return t.encodeChunkBranchedNoSuffix(dst, dstPos, buf, end)
-	}
-	return t.encodeChunkBranched(dst, dstPos, buf, end, byteLim)
-}
-
-// encodeChunkBranchedNoSuffix: noSuffixOpt=true, avoidBranch=false
-func (t *Table) encodeChunkBranchedNoSuffix(dst []byte, dstPos int, buf []byte, end int) int {
-	position := 0
+// encodeChunk compresses buf[0:end] to dst starting at dstPos.
+// buf must have >=8 bytes padding after end for safe unaligned loads.
+func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 	suffixLim := uint8(t.suffixLim)
+	position := 0
 
 	for position < end {
 		word := fsstUnalignedLoad(buf[position:])
-		code := t.shortCodes[uint16(word&fsstMask16)]
 
-		// Fast path: 2-byte code without suffix check
-		// But only if we have at least 2 bytes remaining
+		// Try 2-byte fast path (unique prefix)
+		code := t.shortCodes[uint16(word&fsstMask16)]
 		if uint8(code) < suffixLim && position+2 <= end {
 			dst[dstPos] = uint8(code)
 			dstPos++
@@ -604,242 +431,49 @@ func (t *Table) encodeChunkBranchedNoSuffix(dst []byte, dstPos int, buf []byte, 
 			continue
 		}
 
-		// Length-specific hash table lookup for 3+ byte matches
-		prefix24 := word & fsstMask24
-		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
-		var hashSymbol symbol
-		var found bool
-
-		// Probe length-specific tables (8→7→6→5→4→3)
-		if hashSymbol = t.hashTab8[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == word && position+8 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab7[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFFFF) && position+7 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab6[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFF) && position+6 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab5[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFF) && position+5 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab4[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFF) && position+4 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab3[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFF) && position+3 <= end {
-			found = true
-		}
-
-		if found {
-			dst[dstPos] = uint8(hashSymbol.code())
-			dstPos++
-			position += int(hashSymbol.length())
-		} else {
-			// 1-byte or escape fallback
-			escapeByte := uint8(word)
-
-			// If shortCodes gave us a 2-byte code but we only have 1 byte, use byteCodes instead
-			advance := int(code >> fsstLenBits)
-			if position+advance > end {
-				code = t.byteCodes[escapeByte]
-			}
-
-			codeU8 := uint8(code)
-			dst[dstPos] = codeU8
-			dstPos++
-			if (code & fsstCodeBase) != 0 {
-				dst[dstPos] = escapeByte
+		// Try 3-8 byte hash table match
+		idx := fsstHash(word&fsstMask24) & (fsstHashTabSize - 1)
+		entry := t.hashTab[idx]
+		if entry.icl < fsstICLFree {
+			mask := ^uint64(0) >> entry.ignoredBits()
+			symLen := int(entry.length())
+			if entry.val == (word&mask) && position+symLen <= end {
+				dst[dstPos] = uint8(entry.code())
 				dstPos++
+				position += symLen
+				continue
 			}
-			position++
 		}
+
+		// Fall back to 2-byte (if valid) or 1-byte/escape
+		advance := int(code >> fsstLenBits)
+		if position+advance > end {
+			code = t.byteCodes[uint8(word)]
+			advance = 1
+		}
+
+		dst[dstPos] = uint8(code)
+		dstPos++
+		if code&fsstCodeBase != 0 {
+			dst[dstPos] = uint8(word)
+			dstPos++
+		}
+		position += advance
 	}
 	return dstPos
 }
 
-// encodeChunkBranched: noSuffixOpt=false, avoidBranch=false
-func (t *Table) encodeChunkBranched(dst []byte, dstPos int, buf []byte, end int, byteLim uint8) int {
-	position := 0
-
-	for position < end {
-		word := fsstUnalignedLoad(buf[position:])
-		code := t.shortCodes[uint16(word&fsstMask16)]
-		codeU8 := uint8(code)
-
-		// Check if 2-byte shortCode is valid before hash lookup
-		// But only if we have at least 2 bytes remaining
-		if codeU8 < byteLim && position+2 <= end {
-			dst[dstPos] = codeU8
-			dstPos++
-			position += 2
-			continue
-		}
-
-		// Length-specific hash table lookup for 3+ byte matches
-		prefix24 := word & fsstMask24
-		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
-		var hashSymbol symbol
-		var found bool
-
-		// Probe length-specific tables (8→7→6→5→4→3)
-		if hashSymbol = t.hashTab8[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == word && position+8 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab7[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFFFF) && position+7 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab6[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFFFF) && position+6 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab5[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFFFF) && position+5 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab4[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFFFF) && position+4 <= end {
-			found = true
-		} else if hashSymbol = t.hashTab3[hashIndex]; hashSymbol.icl < fsstICLFree && hashSymbol.val == (word & 0xFFFFFF) && position+3 <= end {
-			found = true
-		}
-
-		if found {
-			dst[dstPos] = uint8(hashSymbol.code())
-			dstPos++
-			position += int(hashSymbol.length())
-		} else {
-			// 1-byte or escape fallback
-			escapeByte := uint8(word)
-
-			// If shortCodes gave us a 2-byte code but we only have 1 byte, use byteCodes instead
-			advance := int(code >> fsstLenBits)
-			if position+advance > end {
-				code = t.byteCodes[escapeByte]
-			}
-
-			codeU8 = uint8(code)
-			dst[dstPos] = codeU8
-			dstPos++
-			if (code & fsstCodeBase) != 0 {
-				dst[dstPos] = escapeByte
-				dstPos++
-			}
-			position++
-		}
-	}
-	return dstPos
-}
-
-// encodeChunkBranchlessNoSuffix: noSuffixOpt=true, avoidBranch=true
-func (t *Table) encodeChunkBranchlessNoSuffix(dst []byte, dstPos int, buf []byte, end int) int {
-	position := 0
-	suffixLim := uint8(t.suffixLim)
-
-	for position < end {
-		word := fsstUnalignedLoad(buf[position:])
-		code := t.shortCodes[uint16(word&fsstMask16)]
-
-		// Fast path: 2-byte code without suffix check
-		if uint8(code) < suffixLim && position+2 <= end {
-			dst[dstPos] = uint8(code)
-			dstPos++
-			position += 2
-			continue
-		}
-
-		// Hash table lookup
-		prefix24 := word & fsstMask24
-		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
-		hashSymbol := t.hashTab[hashIndex]
-		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
-		maskedWord := word & symbolMask
-		symbolLen := int(hashSymbol.length())
-
-		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord && position+symbolLen <= end {
-			dst[dstPos] = uint8(hashSymbol.code())
-			dstPos++
-			position += symbolLen
-		} else {
-			// Branchless fallback
-			advance := int(code >> fsstLenBits)
-			escapeByte := uint8(word)
-
-			// If we'd read past the end, use byteCodes for single byte instead
-			if position+advance > end {
-				code = t.byteCodes[escapeByte]
-				advance = 1
-			}
-
-			codeU8 := uint8(code)
-			dst[dstPos] = codeU8
-			dstPos++
-			if (code & fsstCodeBase) != 0 {
-				dst[dstPos] = escapeByte
-				dstPos++
-			}
-			position += advance
-		}
-	}
-	return dstPos
-}
-
-// encodeChunkBranchless: noSuffixOpt=false, avoidBranch=true
-func (t *Table) encodeChunkBranchless(dst []byte, dstPos int, buf []byte, end int, byteLim uint8) int {
-	position := 0
-
-	for position < end {
-		word := fsstUnalignedLoad(buf[position:])
-		code := t.shortCodes[uint16(word&fsstMask16)]
-
-		// Hash table lookup
-		prefix24 := word & fsstMask24
-		hashIndex := fsstHash(prefix24) & (fsstHashTabSize - 1)
-		hashSymbol := t.hashTab[hashIndex]
-		symbolMask := ^uint64(0) >> hashSymbol.ignoredBits()
-		maskedWord := word & symbolMask
-		symbolLen := int(hashSymbol.length())
-
-		if hashSymbol.icl < fsstICLFree && hashSymbol.val == maskedWord && position+symbolLen <= end {
-			dst[dstPos] = uint8(hashSymbol.code())
-			dstPos++
-			position += symbolLen
-		} else {
-			// Branchless fallback
-			advance := int(code >> fsstLenBits)
-			escapeByte := uint8(word)
-
-			// If we'd read past the end, use byteCodes for single byte instead
-			if position+advance > end {
-				code = t.byteCodes[escapeByte]
-				advance = 1
-			}
-
-			codeU8 := uint8(code)
-			dst[dstPos] = codeU8
-			dstPos++
-			if (code & fsstCodeBase) != 0 {
-				dst[dstPos] = escapeByte
-				dstPos++
-			}
-			position += advance
-		}
-	}
-	return dstPos
-}
-
-// Decode decompresses src, optionally reusing buf for output.
-// buf can be nil or undersized; it will be grown as needed.
-// Returns the decompressed data (may have different backing array than buf).
+// Decode decompresses src, reusing buf if provided.
 func (t *Table) Decode(buf, src []byte) []byte {
-	// Lazy-initialize decoder structures
-	if !t.decReady {
-		for code := uint16(0); code < t.nSymbols; code++ {
-			sym := t.symbols[code]
-			t.decLen[code] = byte(sym.length())
-			t.decSymbol[code] = sym.val
-		}
-		t.decReady = true
-	}
-
 	if buf == nil {
 		buf = make([]byte, 0, len(src)*4+8)
 	} else {
-		buf = buf[:0] // Reset length but keep capacity
+		buf = buf[:0]
 	}
 
 	bufPos := 0
 	srcPos := 0
 	bufCap := cap(buf)
-
-	// Extend to max capacity upfront to reduce slice bound checks
 	if bufCap > 0 {
 		buf = buf[:bufCap]
 	}
@@ -849,46 +483,44 @@ func (t *Table) Decode(buf, src []byte) []byte {
 		srcPos++
 
 		if code < fsstEscapeCode {
-			// Decode learned symbol
-			symbolLength := int(t.decLen[code])
-			symbolValue := t.decSymbol[code]
+			symLen := int(t.decLen[code])
+			symVal := t.decSymbol[code]
 
-			// Grow buffer if needed
-			if bufPos+symbolLength > bufCap {
-				newCap := max(bufCap*2, bufPos+symbolLength)
+			if bufPos+symLen > bufCap {
+				newCap := max(bufCap*2, bufPos+symLen)
 				newBuf := make([]byte, newCap)
 				copy(newBuf, buf[:bufPos])
 				buf = newBuf
 				bufCap = newCap
 			}
 
-			// Direct write: unrolled for common lengths
-			switch symbolLength {
+			// Write symbol bytes (unrolled for common lengths)
+			switch symLen {
 			case 1:
-				buf[bufPos] = byte(symbolValue)
+				buf[bufPos] = byte(symVal)
 			case 2:
-				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symbolValue))
+				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symVal))
 			case 3:
-				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symbolValue))
-				buf[bufPos+2] = byte(symbolValue >> 16)
+				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symVal))
+				buf[bufPos+2] = byte(symVal >> 16)
 			case 4:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symVal))
 			case 5:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
-				buf[bufPos+4] = byte(symbolValue >> 32)
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symVal))
+				buf[bufPos+4] = byte(symVal >> 32)
 			case 6:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
-				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symbolValue>>32))
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symVal))
+				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symVal>>32))
 			case 7:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symbolValue))
-				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symbolValue>>32))
-				buf[bufPos+6] = byte(symbolValue >> 48)
+				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symVal))
+				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symVal>>32))
+				buf[bufPos+6] = byte(symVal >> 48)
 			case 8:
-				binary.LittleEndian.PutUint64(buf[bufPos:], symbolValue)
+				binary.LittleEndian.PutUint64(buf[bufPos:], symVal)
 			}
-			bufPos += symbolLength
+			bufPos += symLen
 		} else {
-			// Escape code: next byte is literal
+			// Escape: next byte is literal
 			if srcPos >= len(src) {
 				break
 			}
@@ -907,43 +539,12 @@ func (t *Table) Decode(buf, src []byte) []byte {
 	return buf[:bufPos]
 }
 
-// DecodeAll decompresses src and returns a newly allocated byte slice with the result.
+// DecodeAll decompresses src and returns a newly allocated slice.
 func (t *Table) DecodeAll(src []byte) []byte {
 	return t.Decode(nil, src)
 }
 
-// DecodeString decompresses a string and returns a newly allocated byte slice.
+// DecodeString decompresses a string.
 func (t *Table) DecodeString(s string) []byte {
 	return t.Decode(nil, unsafe.Slice(unsafe.StringData(s), len(s)))
-}
-
-// chooseVariant selects the best encoding strategy based on symbol statistics.
-// Returns flags for two encoding optimizations:
-//   - noSuffixOpt: skip suffix checking for 2-byte symbols (when >65% are 2-byte and >95% have no suffix conflicts)
-//   - avoidBranch: use branchless encoding (helps when symbol distribution is balanced)
-//
-// Thresholds are empirically derived from benchmarking on text corpora.
-func chooseVariant(t *Table) (noSuffixOpt, avoidBranch bool) {
-	// noSuffixOpt: most symbols are 2-byte with few conflicts
-	// Check: 2-byte symbols > 65% of total AND non-conflicting 2-byte > 95% of 2-byte symbols
-	if 100*int(t.lenHisto[1]) > 65*int(t.nSymbols) && 100*int(t.suffixLim) > 95*int(t.lenHisto[1]) {
-		noSuffixOpt = true
-	}
-
-	// avoidBranch: symbol distribution is balanced, causing poor branch prediction
-	// Use branchless (predicated) execution to avoid CPU pipeline stalls
-	//
-	// Heuristic checks (empirically derived from benchmarking):
-	//   1. Moderate number of 1-byte symbols (24-92): not too rare, not too common
-	//   2. Either few 1-byte (<43) OR few long symbols (7-8 bytes < 29 combined)
-	//   3. Either moderate 1-byte (<72) OR few 3-byte symbols (<72)
-	//
-	// These thresholds detect "balanced" distributions where branch predictor
-	// struggles to learn patterns, making branchless code faster despite extra work.
-	if (t.lenHisto[0] > 24 && t.lenHisto[0] < 92) &&
-		(t.lenHisto[0] < 43 || t.lenHisto[6]+t.lenHisto[7] < 29) &&
-		(t.lenHisto[0] < 72 || t.lenHisto[2] < 72) {
-		avoidBranch = true
-	}
-	return
 }

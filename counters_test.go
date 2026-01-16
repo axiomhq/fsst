@@ -7,49 +7,43 @@ func TestCountersBasic(t *testing.T) {
 
 	// Test single-symbol counting
 	c.incSingle(5)
-	if c.singleLow[5] != 1 || c.singleHigh[5] != 1 {
-		t.Fatalf("incSingle first increment failed")
+	if c.single[5] != 1 {
+		t.Fatalf("incSingle first increment: got %d, want 1", c.single[5])
 	}
 	c.incSingle(5)
-	if c.singleLow[5] != 2 || c.singleHigh[5] != 1 {
-		t.Fatalf("incSingle second increment failed")
+	if c.single[5] != 2 {
+		t.Fatalf("incSingle second increment: got %d, want 2", c.single[5])
 	}
 
 	// Test pair counting
 	c.incPair(3, 4)
-	if c.pairLow[3][4] == 0 {
-		t.Fatalf("incPair low byte not set")
-	}
-	// Check nibble-packed high byte (4 is even, so low nibble of byte 2)
-	if c.pairHigh[3][2] == 0 {
-		t.Fatalf("incPair high nibble not set")
+	if c.pair[3][4] != 1 {
+		t.Fatalf("incPair first increment: got %d, want 1", c.pair[3][4])
 	}
 
 	// Test nextSingle
-	symbolCode := uint32(6)
+	code := uint32(6)
 	c.incSingle(10)
-	count := c.nextSingle(&symbolCode)
-	if count == 0 || symbolCode != 10 {
-		t.Fatalf("nextSingle failed: symbolCode=%d count=%d", symbolCode, count)
+	count := c.nextSingle(&code)
+	if count == 0 || code != 10 {
+		t.Fatalf("nextSingle failed: code=%d count=%d", code, count)
 	}
 
-	// Test nextPair
-	pairCode := uint32(0)
+	// Test pairCount
 	c.incPair(10, 2)
-	pairCount := c.nextPair(10, &pairCode)
-	if pairCount == 0 || pairCode != 2 {
-		t.Fatalf("nextPair failed: pairCode=%d count=%d", pairCode, pairCount)
+	pairCnt := c.pairCount(10, 2)
+	if pairCnt != 1 {
+		t.Fatalf("pairCount failed: got %d, want 1", pairCnt)
 	}
 
-	// Test early increment compensation
+	// Test counting to 256 and beyond
 	var c2 counters
-	// Increment 256 times: high should be 1 after compensation
-	for i := 0; i < 256; i++ {
+	for i := 0; i < 300; i++ {
 		c2.incSingle(0)
 	}
-	code := uint32(0)
+	code = 0
 	got := c2.nextSingle(&code)
-	if got != 256 {
-		t.Fatalf("early increment compensation failed: expected 256, got %d", got)
+	if got != 300 {
+		t.Fatalf("high count failed: expected 300, got %d", got)
 	}
 }
