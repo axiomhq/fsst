@@ -2,6 +2,7 @@ package fsst
 
 import (
 	"bytes"
+	"container/heap"
 	"encoding/binary"
 	"io"
 	"unsafe"
@@ -653,17 +654,29 @@ type qsym12 struct {
 	gain   uint32
 }
 
+// qsymHeap12 is a min-heap of qsym12 based on gain (with tiebreak on symbol.val).
+// Implements heap.Interface for use with container/heap.
 type qsymHeap12 []qsym12
 
+// Len implements heap.Interface and returns the number of elements.
 func (h qsymHeap12) Len() int { return len(h) }
+
+// Less implements heap.Interface ordering by ascending gain, breaking ties
+// by larger symbol value to keep selection deterministic.
 func (h qsymHeap12) Less(i, j int) bool {
 	if h[i].gain != h[j].gain {
 		return h[i].gain < h[j].gain
 	}
 	return h[i].symbol.val > h[j].symbol.val
 }
+
+// Swap implements heap.Interface swap.
 func (h qsymHeap12) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-func (h *qsymHeap12) Push(x any)   { *h = append(*h, x.(qsym12)) }
+
+// Push implements heap.Interface push.
+func (h *qsymHeap12) Push(x any) { *h = append(*h, x.(qsym12)) }
+
+// Pop implements heap.Interface pop.
 func (h *qsymHeap12) Pop() any {
 	old := *h
 	n := len(old)
@@ -673,7 +686,6 @@ func (h *qsymHeap12) Pop() any {
 }
 
 func buildCandidates12(t *Table12, c *counters12, frac int, candidates map[[2]uint64]qsym12, h *qsymHeap12, list *[]qsym12) {
-	import_heap()
 	clear(candidates)
 	minCount := max((minCountNumerator*frac)/minCountDenominator, 1)
 
@@ -749,15 +761,15 @@ func buildCandidates12(t *Table12, c *counters12, frac int, candidates map[[2]ui
 
 	// Select top candidates using min-heap
 	*h = (*h)[:0]
-	heap_init(h)
+	heap.Init(h)
 
 	for _, candidate := range candidates {
 		if len(*h) < fsst12MaxSymbols {
-			heap_push(h, candidate)
+			heap.Push(h, candidate)
 		} else if candidate.gain > (*h)[0].gain ||
 			(candidate.gain == (*h)[0].gain && candidate.symbol.val < (*h)[0].symbol.val) {
-			heap_pop(h)
-			heap_push(h, candidate)
+			heap.Pop(h)
+			heap.Push(h, candidate)
 		}
 	}
 
@@ -769,7 +781,7 @@ func buildCandidates12(t *Table12, c *counters12, frac int, candidates map[[2]ui
 		*list = (*list)[:len(*h)]
 	}
 	for i := len(*h) - 1; i >= 0; i-- {
-		(*list)[i] = heap_pop(h).(qsym12)
+		(*list)[i] = heap.Pop(h).(qsym12)
 	}
 	for i, j := 0, len(*list)-1; i < j; i, j = i+1, j-1 {
 		(*list)[i], (*list)[j] = (*list)[j], (*list)[i]
@@ -782,51 +794,3 @@ func buildCandidates12(t *Table12, c *counters12, frac int, candidates map[[2]ui
 	}
 }
 
-// Heap operations (avoiding import to keep file self-contained)
-func import_heap()                      {}
-func heap_init(h *qsymHeap12)           { heapify12(h) }
-func heap_push(h *qsymHeap12, x qsym12) { *h = append(*h, x); heapUp12(h, len(*h)-1) }
-func heap_pop(h *qsymHeap12) any {
-	n := len(*h) - 1
-	(*h)[0], (*h)[n] = (*h)[n], (*h)[0]
-	heapDown12(h, 0, n)
-	x := (*h)[n]
-	*h = (*h)[:n]
-	return x
-}
-
-func heapify12(h *qsymHeap12) {
-	n := len(*h)
-	for i := n/2 - 1; i >= 0; i-- {
-		heapDown12(h, i, n)
-	}
-}
-
-func heapUp12(h *qsymHeap12, i int) {
-	for {
-		parent := (i - 1) / 2
-		if i == 0 || !(*h).Less(i, parent) {
-			break
-		}
-		(*h).Swap(i, parent)
-		i = parent
-	}
-}
-
-func heapDown12(h *qsymHeap12, i, n int) {
-	for {
-		left := 2*i + 1
-		if left >= n {
-			break
-		}
-		smallest := left
-		if right := left + 1; right < n && (*h).Less(right, left) {
-			smallest = right
-		}
-		if !(*h).Less(smallest, i) {
-			break
-		}
-		(*h).Swap(i, smallest)
-		i = smallest
-	}
-}

@@ -66,8 +66,8 @@ type symbol struct {
 func newSymbolFromByte(b byte, code uint16) symbol {
 	return symbol{
 		val: uint64(b),
-		// icl format: [length:4][code:12][ignoredBits:16]
-		// length=1, ignoredBits=(8-1)*8=56 (ignore top 7 bytes when matching)
+		// length=1 at bits 28-31, code at bits 16-27,
+		// ignoredBits=56 at bits 0-15 (masks out top 7 bytes in 8-byte loads).
 		icl: (uint64(1) << 28) | (uint64(code) << 16) | 56,
 	}
 }
@@ -83,13 +83,23 @@ func newSymbolFromBytes(in []byte) symbol {
 	return sym
 }
 
+// setCodeLen packs code and length into the icl field.
+//
+//	bits 28-31: length (1-8)
+//	bits 16-27: code (0-511)
+//	bits  0-15: ignoredBits = (8-length)*8
+//
+// ignoredBits is used to build a mask that zeroes out bytes beyond the
+// symbol's length when comparing against an 8-byte load from the input.
+// For example, a 3-byte symbol has ignoredBits=40, so the mask is
+// ^uint64(0) >> 40 = 0x0000_00FF_FFFF (keeps only the low 3 bytes).
 func (s *symbol) setCodeLen(code uint32, length uint32) {
 	s.icl = (uint64(length) << 28) | (uint64(code) << 16) | uint64((8-length)*8)
 }
 
-func (s symbol) length() uint32      { return uint32(s.icl >> 28) }
-func (s symbol) code() uint16        { return uint16((s.icl >> 16) & fsstCodeMask) }
-func (s symbol) ignoredBits() uint32 { return uint32(s.icl & fsstMask16) }
+func (s symbol) length() uint32      { return uint32(s.icl >> 28) }       // bits 28-31
+func (s symbol) code() uint16        { return uint16((s.icl >> 16) & fsstCodeMask) } // bits 16-27
+func (s symbol) ignoredBits() uint32 { return uint32(s.icl & fsstMask16) }           // bits 0-15
 func (s symbol) first() byte         { return byte(s.val & fsstMask8) }
 func (s symbol) first2() uint16      { return uint16(s.val & fsstMask16) }
 func (s symbol) hash() uint64        { return fsstHash(s.val & fsstMask24) }

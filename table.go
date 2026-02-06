@@ -413,16 +413,29 @@ func (t *Table) EncodeAll(input []byte) []byte {
 	return t.Encode(nil, input)
 }
 
-// encodeChunk compresses buf[0:end] to dst starting at dstPos.
-// buf must have >=8 bytes padding after end for safe unaligned loads.
+// encodeChunk compresses buf[0:end] into dst starting at dstPos using a
+// three-tier lookup strategy, ordered by expected match length:
+//
+//  1. 2-byte fast path: symbols whose 2-byte prefix is unique (code < suffixLim)
+//     can be emitted without further checks. This is the most common hit for
+//     tables with many unique 2-byte patterns.
+//  2. 3-8 byte hash lookup: a direct-mapped hash table keyed on the first 3
+//     bytes. If the full symbol matches (after masking unused high bytes), emit it.
+//  3. Fallback: use the 2-byte shortCodes table (which may yield a 2-byte or
+//     1-byte match), or emit a 1-byte/escape code.
+//
+// buf must have >=8 bytes of padding after end for safe unaligned 8-byte loads.
 func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 	suffixLim := uint8(t.suffixLim)
 	position := 0
 
 	for position < end {
+		// Load 8 bytes starting at position (safe due to padding guarantee).
 		word := fsstUnalignedLoad(buf[position:])
 
-		// Try 2-byte fast path (unique prefix)
+		// Tier 1: 2-byte fast path for symbols with unique prefixes.
+		// suffixLim partitions shortCodes: codes below it have unique 2-byte
+		// prefixes and need no further disambiguation.
 		code := t.shortCodes[uint16(word&fsstMask16)]
 		if uint8(code) < suffixLim && position+2 <= end {
 			dst[dstPos] = uint8(code)
@@ -431,10 +444,11 @@ func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 			continue
 		}
 
-		// Try 3-8 byte hash table match
+		// Tier 2: 3-8 byte hash table lookup (direct-mapped, keyed on first 3 bytes).
 		idx := fsstHash(word&fsstMask24) & (fsstHashTabSize - 1)
 		entry := t.hashTab[idx]
 		if entry.icl < fsstICLFree {
+			// Mask off bytes beyond the symbol's length before comparing.
 			mask := ^uint64(0) >> entry.ignoredBits()
 			symLen := int(entry.length())
 			if entry.val == (word&mask) && position+symLen <= end {
@@ -445,7 +459,8 @@ func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 			}
 		}
 
-		// Fall back to 2-byte (if valid) or 1-byte/escape
+		// Tier 3: fall back to 2-byte shortCode (if valid) or 1-byte/escape.
+		// The top bits of code encode the advance length (1 or 2).
 		advance := int(code >> fsstLenBits)
 		if position+advance > end {
 			code = t.byteCodes[uint8(word)]
@@ -454,6 +469,7 @@ func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 
 		dst[dstPos] = uint8(code)
 		dstPos++
+		// If code >= fsstCodeBase, this is an escape: emit the literal byte too.
 		if code&fsstCodeBase != 0 {
 			dst[dstPos] = uint8(word)
 			dstPos++
