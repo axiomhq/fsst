@@ -1,7 +1,7 @@
 package fsst
 
 import (
-	"encoding/binary"
+	"unsafe"
 )
 
 const (
@@ -39,7 +39,7 @@ const (
 	mask24 = 0xFFFFFF // 24-bit mask (3 bytes)
 )
 
-func unalignedLoad(b []byte) uint64 { return binary.LittleEndian.Uint64(b) }
+func unalignedLoad(b []byte) uint64 { return *(*uint64)(unsafe.Pointer(&b[0])) }
 func hashWord(w uint64) uint64       { x := w * hashPrime; return x ^ (x >> hashShift) }
 
 // packCodeLength combines a code and length into a packed uint16 used by byteCodes/shortCodes.

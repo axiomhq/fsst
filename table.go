@@ -448,10 +448,11 @@ func (t *Table) EncodeAll(input []byte) []byte {
 func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 	suffixLim := uint8(t.suffixLim)
 	position := 0
+	bufBase := unsafe.Pointer(unsafe.SliceData(buf))
 
 	for position < end {
 		// Load 8 bytes starting at position (safe due to padding guarantee).
-		word := unalignedLoad(buf[position:])
+		word := *(*uint64)(unsafe.Add(bufBase, position))
 
 		// Tier 1: 2-byte fast path for symbols with unique prefixes.
 		// suffixLim partitions shortCodes: codes below it have unique 2-byte
@@ -469,10 +470,10 @@ func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 		entry := t.hashTab[idx]
 		if entry.icl < iclFree {
 			// Mask off bytes beyond the symbol's length before comparing.
-			mask := ^uint64(0) >> entry.ignoredBits()
-			symLen := int(entry.length())
+			mask := ^uint64(0) >> uint32(entry.icl&mask16)
+			symLen := int(entry.icl >> 28)
 			if entry.val == (word&mask) && position+symLen <= end {
-				dst[dstPos] = uint8(entry.code())
+				dst[dstPos] = uint8(entry.icl >> 16)
 				dstPos++
 				position += symLen
 				continue
@@ -501,75 +502,56 @@ func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 
 // Decode decompresses src, reusing buf if provided.
 func (t *Table) Decode(buf, src []byte) []byte {
+	srcLen := len(src)
+	// Worst case: every code is an escape (2 src bytes → 1 output byte),
+	// best case: every code is an 8-byte symbol (1 src byte → 8 output bytes).
+	// Use 4x+8 as a reasonable estimate that avoids regrowth for most inputs.
+	needed := srcLen*4 + 8
 	if buf == nil {
-		buf = make([]byte, 0, len(src)*4+8)
+		buf = make([]byte, needed)
 	} else {
-		buf = buf[:0]
+		if cap(buf) < needed {
+			buf = make([]byte, needed)
+		} else {
+			buf = buf[:cap(buf)]
+		}
 	}
 
 	bufPos := 0
 	srcPos := 0
-	bufCap := cap(buf)
-	if bufCap > 0 {
-		buf = buf[:bufCap]
-	}
+	bufCap := len(buf)
+	// Ensure the slice backing array is used for unsafe writes.
+	bufPtr := unsafe.Pointer(unsafe.SliceData(buf))
 
-	for srcPos < len(src) {
-		code := src[srcPos]
-		srcPos++
-
-		if code < escapeCode {
-			symLen := int(t.decLen[code])
-			symVal := t.decSymbol[code]
-
-			if bufPos+symLen > bufCap {
-				newCap := max(bufCap*2, bufPos+symLen)
-				newBuf := make([]byte, newCap)
-				copy(newBuf, buf[:bufPos])
-				buf = newBuf
-				bufCap = newCap
-			}
-
-			// Write symbol bytes (unrolled for common lengths)
-			switch symLen {
-			case 1:
-				buf[bufPos] = byte(symVal)
-			case 2:
-				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symVal))
-			case 3:
-				binary.LittleEndian.PutUint16(buf[bufPos:], uint16(symVal))
-				buf[bufPos+2] = byte(symVal >> 16)
-			case 4:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symVal))
-			case 5:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symVal))
-				buf[bufPos+4] = byte(symVal >> 32)
-			case 6:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symVal))
-				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symVal>>32))
-			case 7:
-				binary.LittleEndian.PutUint32(buf[bufPos:], uint32(symVal))
-				binary.LittleEndian.PutUint16(buf[bufPos+4:], uint16(symVal>>32))
-				buf[bufPos+6] = byte(symVal >> 48)
-			case 8:
-				binary.LittleEndian.PutUint64(buf[bufPos:], symVal)
-			}
-			bufPos += symLen
-		} else {
-			// Escape: next byte is literal
-			if srcPos >= len(src) {
-				break
-			}
-			if bufPos >= bufCap {
-				newCap := max(bufCap*2, bufPos+1)
-				newBuf := make([]byte, newCap)
-				copy(newBuf, buf[:bufPos])
-				buf = newBuf
-				bufCap = newCap
-			}
-			buf[bufPos] = src[srcPos]
-			bufPos++
+	for srcPos < srcLen {
+		// Fast inner loop: process codes while output buffer has room for
+		// 8-byte writes. This avoids per-iteration capacity checks.
+		for srcPos < srcLen && bufPos+8 <= bufCap {
+			code := src[srcPos]
 			srcPos++
+
+			if code < escapeCode {
+				*(*uint64)(unsafe.Add(bufPtr, bufPos)) = t.decSymbol[code]
+				bufPos += int(t.decLen[code])
+			} else {
+				// Escape: next byte is literal
+				if srcPos >= srcLen {
+					return buf[:bufPos]
+				}
+				*(*byte)(unsafe.Add(bufPtr, bufPos)) = src[srcPos]
+				bufPos++
+				srcPos++
+			}
+		}
+
+		// Grow buffer if needed
+		if srcPos < srcLen && bufPos+8 > bufCap {
+			newCap := max(bufCap*2, bufPos+srcLen*8+8)
+			newBuf := make([]byte, newCap)
+			copy(newBuf, buf[:bufPos])
+			buf = newBuf
+			bufCap = newCap
+			bufPtr = unsafe.Pointer(unsafe.SliceData(buf))
 		}
 	}
 	return buf[:bufPos]
