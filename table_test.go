@@ -40,7 +40,7 @@ func TestFinalize(t *testing.T) {
 	}
 	// shortCodes for unknown 2-byte pattern must map to byteCodes of first byte
 	sc := tbl.shortCodes[int('Z')<<8|int('Q')]
-	if (sc&fsstCodeMask) >= fsstCodeBase && sc>>fsstLenBits != 1 {
+	if (sc&codeMask) >= codeBase && sc>>lenBits != 1 {
 		t.Fatalf("shortCodes not patched for single byte fallback")
 	}
 }
@@ -129,6 +129,66 @@ func TestDecodeAPIs(t *testing.T) {
 		}
 	})
 
+}
+
+// TestReadFromMalformed verifies that ReadFrom rejects crafted inputs
+// without panicking.
+func TestReadFromMalformed(t *testing.T) {
+	// Helper: build a valid serialized table to use as a base.
+	validTable := func() []byte {
+		tbl := Train([][]byte{[]byte("hello world hello")})
+		var buf bytes.Buffer
+		tbl.WriteTo(&buf)
+		return buf.Bytes()
+	}
+
+	t.Run("bad_version", func(t *testing.T) {
+		data := validTable()
+		// Corrupt version (first 4 bytes of the 8-byte header)
+		data[4] = 0xFF
+		var tbl Table
+		_, err := tbl.ReadFrom(bytes.NewReader(data))
+		if err != ErrBadVersion {
+			t.Fatalf("expected ErrBadVersion, got %v", err)
+		}
+	})
+
+	t.Run("lenHisto_sum_exceeds_nSymbols", func(t *testing.T) {
+		data := validTable()
+		// lenHisto starts at byte 8, 8 bytes long.
+		// Set all histo entries to 255 so sum far exceeds nSymbols.
+		for i := 8; i < 16; i++ {
+			data[i] = 255
+		}
+		var tbl Table
+		_, err := tbl.ReadFrom(bytes.NewReader(data))
+		if err != ErrCorrupted {
+			t.Fatalf("expected ErrCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("lenHisto_sum_less_than_nSymbols", func(t *testing.T) {
+		data := validTable()
+		// Zero out lenHisto so sum=0 but nSymbols>0.
+		for i := 8; i < 16; i++ {
+			data[i] = 0
+		}
+		var tbl Table
+		_, err := tbl.ReadFrom(bytes.NewReader(data))
+		if err != ErrCorrupted {
+			t.Fatalf("expected ErrCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("truncated_input", func(t *testing.T) {
+		data := validTable()
+		// Truncate to just the header
+		var tbl Table
+		_, err := tbl.ReadFrom(bytes.NewReader(data[:8]))
+		if err == nil {
+			t.Fatalf("expected error on truncated input")
+		}
+	})
 }
 
 // BenchmarkDecode benchmarks different decode scenarios

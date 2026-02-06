@@ -140,6 +140,62 @@ func TestTable12Strings(t *testing.T) {
 	}
 }
 
+// TestTable12ReadFromMalformed verifies that Table12.ReadFrom rejects
+// crafted inputs without panicking.
+func TestTable12ReadFromMalformed(t *testing.T) {
+	validTable := func() []byte {
+		tbl := Train12([][]byte{[]byte("hello world hello")})
+		data, _ := tbl.MarshalBinary()
+		return data
+	}
+
+	t.Run("bad_version", func(t *testing.T) {
+		data := validTable()
+		data[0] = 0xFF // corrupt version
+		var tbl Table12
+		_, err := tbl.ReadFrom(bytes.NewReader(data))
+		if err != ErrBadVersion {
+			t.Fatalf("expected ErrBadVersion, got %v", err)
+		}
+	})
+
+	t.Run("nSymbols_exceeds_max", func(t *testing.T) {
+		data := validTable()
+		// nSymbols is at bytes 8-9 (after 8-byte version header)
+		// Set to 65535 which exceeds fsst12MaxSymbols (3840)
+		data[8] = 0xFF
+		data[9] = 0xFF
+		var tbl Table12
+		_, err := tbl.ReadFrom(bytes.NewReader(data))
+		if err != ErrCorrupted {
+			t.Fatalf("expected ErrCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("lenHisto_sum_mismatch", func(t *testing.T) {
+		data := validTable()
+		// lenHisto starts at byte 10, 8 bytes long.
+		// Set all histo entries to 255 so sum far exceeds nSymbols.
+		for i := 10; i < 18; i++ {
+			data[i] = 255
+		}
+		var tbl Table12
+		_, err := tbl.ReadFrom(bytes.NewReader(data))
+		if err != ErrCorrupted {
+			t.Fatalf("expected ErrCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("truncated_input", func(t *testing.T) {
+		data := validTable()
+		var tbl Table12
+		_, err := tbl.ReadFrom(bytes.NewReader(data[:8]))
+		if err == nil {
+			t.Fatalf("expected error on truncated input")
+		}
+	})
+}
+
 func BenchmarkTable12Encode(b *testing.B) {
 	data := bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog "), 1000)
 	tbl := Train12([][]byte{data})
