@@ -9,8 +9,8 @@ package fsst
 //
 // Total size: ~520KB (acceptable for training phase, discarded after).
 type counters struct {
-	single   [fsstCodeMax]uint16              // Single-symbol counts
-	pair     [fsstCodeMax][fsstCodeMax]uint16 // Pair counts
+	single   [codeMax]uint16              // Single-symbol counts
+	pair     [codeMax][codeMax]uint16 // Pair counts
 	pairList [][2]uint32                      // Sparse list of non-zero pairs
 }
 
@@ -34,7 +34,7 @@ func (c *counters) incPair(code1, code2 uint32) {
 // nextSingle advances code to the next non-zero count and returns it.
 // Returns 0 if no more non-zero counts exist.
 func (c *counters) nextSingle(code *uint32) uint32 {
-	for *code < fsstCodeMax {
+	for *code < codeMax {
 		if count := c.single[*code]; count != 0 {
 			return uint32(count)
 		}

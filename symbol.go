@@ -4,50 +4,48 @@ import (
 	"encoding/binary"
 )
 
-// Core constants for FSST compression algorithm
 const (
-	fsstLenBits  = 12
-	fsstCodeBits = 9
-	fsstCodeBase = 256               // First code for learned symbols (0-255 are escapes)
-	fsstCodeMax  = 1 << fsstCodeBits // 512
-	fsstCodeMask = fsstCodeMax - 1   // 0x1FF
+	lenBits  = 12
+	codeBits = 9
+	codeBase = 256              // First code for learned symbols (0-255 are escapes)
+	codeMax  = 1 << codeBits    // 512
+	codeMask = codeMax - 1      // 0x1FF
 
-	fsstHashLog2Size = 11
-	fsstHashTabSize  = 1 << fsstHashLog2Size // 2048 entries
-	fsstHashPrime    = uint64(2971215073)    // Prime for multiplicative hashing
-	fsstShift        = 15
+	hashLog2Size = 11
+	hashTabSize  = 1 << hashLog2Size    // 2048 entries
+	hashPrime    = uint64(2971215073)   // Prime for multiplicative hashing
+	hashShift    = 15
 
-	// fsstICLFree marks unused hash table slots.
+	// iclFree marks unused hash table slots.
 	// Layout: length=15 (impossible) at bits 28-31, code=0x1FF at bits 16-27
-	fsstICLFree = (uint64(15) << 28) | (uint64(fsstCodeMask) << 16)
+	iclFree = (uint64(15) << 28) | (uint64(codeMask) << 16)
 
-	fsstEscapeCode = 255 // Code 255 indicates next byte is literal
-	fsstMaxSymbols = 255 // Maximum number of learned symbols (codes 0-254)
-	fsstChunkSize  = 511 // Process input in 511-byte chunks for cache efficiency
+	escapeCode = 255 // Code 255 indicates next byte is literal
+	maxSymbols = 255 // Maximum number of learned symbols (codes 0-254)
+	chunkSize  = 511 // Process input in 511-byte chunks for cache efficiency
 
 	// Training subsampling mask (0-127 range for deterministic sampling)
-	fsstSampleMask = 127
+	sampleMask = 127
 
 	// Buffer padding for safe unaligned 8-byte loads at chunk boundaries
-	fsstChunkPadding = 9 // 511+9=520: allows 8-byte load at position 511 (511+8-1=518 < 520)
+	chunkPadding = 9 // 511+9=520: allows 8-byte load at position 511 (511+8-1=518 < 520)
 
 	// Output buffer growth factor for worst-case expansion
 	// Worst case: every byte escapes (2 bytes per input byte) + small safety margin
-	fsstOutputPadding = 7 // Safety margin for edge cases
+	outputPadding = 7 // Safety margin for edge cases
 
-	// Bit masks for symbol operations
-	fsstMask8  = 0xFF     // 8-bit mask (1 byte)
-	fsstMask16 = 0xFFFF   // 16-bit mask (2 bytes)
-	fsstMask24 = 0xFFFFFF // 24-bit mask (3 bytes)
+	mask8  = 0xFF     // 8-bit mask (1 byte)
+	mask16 = 0xFFFF   // 16-bit mask (2 bytes)
+	mask24 = 0xFFFFFF // 24-bit mask (3 bytes)
 )
 
-func fsstUnalignedLoad(b []byte) uint64 { return binary.LittleEndian.Uint64(b) }
-func fsstHash(w uint64) uint64          { x := w * fsstHashPrime; return x ^ (x >> fsstShift) }
+func unalignedLoad(b []byte) uint64 { return binary.LittleEndian.Uint64(b) }
+func hashWord(w uint64) uint64       { x := w * hashPrime; return x ^ (x >> hashShift) }
 
 // packCodeLength combines a code and length into a packed uint16 used by byteCodes/shortCodes.
 // Format: (length << 12) | code, where length is 1-8 and code is 0-511.
 func packCodeLength(code uint16, length int) uint16 {
-	return uint16(code) | uint16(length<<fsstLenBits)
+	return uint16(code) | uint16(length<<lenBits)
 }
 
 // symbol is the internal representation of a compression symbol (1-8 bytes).
@@ -79,7 +77,7 @@ func newSymbolFromBytes(in []byte) symbol {
 		value |= uint64(in[i]) << (8 * i)
 	}
 	sym := symbol{val: value}
-	sym.setCodeLen(fsstCodeMax, uint32(length))
+	sym.setCodeLen(codeMax, uint32(length))
 	return sym
 }
 
@@ -98,18 +96,18 @@ func (s *symbol) setCodeLen(code uint32, length uint32) {
 }
 
 func (s symbol) length() uint32      { return uint32(s.icl >> 28) }       // bits 28-31
-func (s symbol) code() uint16        { return uint16((s.icl >> 16) & fsstCodeMask) } // bits 16-27
-func (s symbol) ignoredBits() uint32 { return uint32(s.icl & fsstMask16) }           // bits 0-15
-func (s symbol) first() byte         { return byte(s.val & fsstMask8) }
-func (s symbol) first2() uint16      { return uint16(s.val & fsstMask16) }
-func (s symbol) hash() uint64        { return fsstHash(s.val & fsstMask24) }
+func (s symbol) code() uint16        { return uint16((s.icl >> 16) & codeMask) } // bits 16-27
+func (s symbol) ignoredBits() uint32 { return uint32(s.icl & mask16) }           // bits 0-15
+func (s symbol) first() byte         { return byte(s.val & mask8) }
+func (s symbol) first2() uint16      { return uint16(s.val & mask16) }
+func (s symbol) hash() uint64        { return hashWord(s.val & mask24) }
 
-func fsstConcat(a, b symbol) symbol {
+func concatSymbols(a, b symbol) symbol {
 	lengthA := a.length()
 	lengthB := b.length()
 	combinedLength := min(lengthA+lengthB, 8)
 	combinedValue := (b.val << (8 * lengthA)) | a.val
 	result := symbol{val: combinedValue}
-	result.setCodeLen(fsstCodeMask, uint32(combinedLength))
+	result.setCodeLen(codeMask, uint32(combinedLength))
 	return result
 }

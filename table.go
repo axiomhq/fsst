@@ -14,8 +14,8 @@ type Table struct {
 	// Symbol lookup structures
 	shortCodes [65536]uint16           // 2-byte prefix -> packed [length|code]
 	byteCodes  [256]uint16             // 1-byte -> packed [length|code]
-	symbols    [fsstCodeMax]symbol     // code -> symbol (for decoding and training)
-	hashTab    [fsstHashTabSize]symbol // direct-mapped 3-8 byte symbols
+	symbols    [codeMax]symbol     // code -> symbol (for decoding and training)
+	hashTab    [hashTabSize]symbol // direct-mapped 3-8 byte symbols
 
 	// Symbol metadata
 	nSymbols  uint16    // number of learned symbols (0-255)
@@ -30,7 +30,7 @@ type Table struct {
 	encBuf []byte
 }
 
-const fsstVersion uint64 = 20190218
+const tableVersion uint64 = 20190218
 
 var ErrBadVersion = errors.New("fsst: unsupported table version")
 
@@ -41,14 +41,12 @@ func newTable() *Table {
 	for i := range 256 {
 		t.symbols[i] = newSymbolFromByte(byte(i), packCodeLength(uint16(i), 1))
 	}
-	// Mark remaining slots unused
-	unused := symbol{val: 0, icl: fsstICLFree}
-	for i := 256; i < fsstCodeMax; i++ {
-		t.symbols[i] = unused
+	// Mark remaining symbol slots and hash table as unused
+	empty := symbol{val: 0, icl: iclFree}
+	for i := 256; i < codeMax; i++ {
+		t.symbols[i] = empty
 	}
-	// Empty hash table slots
-	empty := symbol{val: 0, icl: fsstICLFree}
-	for i := range fsstHashTabSize {
+	for i := range hashTabSize {
 		t.hashTab[i] = empty
 	}
 	// byteCodes: each byte escapes to itself
@@ -57,7 +55,7 @@ func newTable() *Table {
 	}
 	// shortCodes: fall back to first byte's code
 	for i := range 65536 {
-		t.shortCodes[i] = packCodeLength(uint16(i&fsstMask8), 1)
+		t.shortCodes[i] = packCodeLength(uint16(i&mask8), 1)
 	}
 	return t
 }
@@ -67,16 +65,16 @@ func (t *Table) clearSymbols() {
 	for i := range t.lenHisto {
 		t.lenHisto[i] = 0
 	}
-	for i := fsstCodeBase; i < int(fsstCodeBase)+int(t.nSymbols); i++ {
+	for i := codeBase; i < int(codeBase)+int(t.nSymbols); i++ {
 		sym := t.symbols[i]
 		switch sym.length() {
 		case 1:
 			t.byteCodes[sym.first()] = packCodeLength(uint16(sym.first()), 1)
 		case 2:
-			t.shortCodes[sym.first2()] = packCodeLength(uint16(sym.first2()&fsstMask8), 1)
+			t.shortCodes[sym.first2()] = packCodeLength(uint16(sym.first2()&mask8), 1)
 		default:
-			idx := sym.hash() & (fsstHashTabSize - 1)
-			t.hashTab[idx] = symbol{val: 0, icl: fsstICLFree}
+			idx := sym.hash() & (hashTabSize - 1)
+			t.hashTab[idx] = symbol{val: 0, icl: iclFree}
 		}
 	}
 	t.nSymbols = 0
@@ -85,8 +83,8 @@ func (t *Table) clearSymbols() {
 // hashInsert adds a 3+ byte symbol to the hash table.
 // Returns false if the slot is already occupied.
 func (t *Table) hashInsert(sym symbol) bool {
-	idx := sym.hash() & (fsstHashTabSize - 1)
-	if t.hashTab[idx].icl < fsstICLFree {
+	idx := sym.hash() & (hashTabSize - 1)
+	if t.hashTab[idx].icl < iclFree {
 		return false
 	}
 	// Mask off unused high bytes before storing
@@ -98,23 +96,23 @@ func (t *Table) hashInsert(sym symbol) bool {
 // addSymbol assigns a new code to sym and installs it into the lookup tables.
 // Returns false if capacity exceeded or hash slot taken.
 func (t *Table) addSymbol(sym symbol) bool {
-	if int(fsstCodeBase)+int(t.nSymbols) >= fsstCodeMax {
+	if int(codeBase)+int(t.nSymbols) >= codeMax {
 		return false
 	}
 	length := sym.length()
-	sym.setCodeLen(uint32(fsstCodeBase)+uint32(t.nSymbols), length)
+	sym.setCodeLen(uint32(codeBase)+uint32(t.nSymbols), length)
 
 	switch length {
 	case 1:
-		t.byteCodes[sym.first()] = packCodeLength(uint16(fsstCodeBase+t.nSymbols), 1)
+		t.byteCodes[sym.first()] = packCodeLength(uint16(codeBase+t.nSymbols), 1)
 	case 2:
-		t.shortCodes[sym.first2()] = packCodeLength(uint16(fsstCodeBase+t.nSymbols), 2)
+		t.shortCodes[sym.first2()] = packCodeLength(uint16(codeBase+t.nSymbols), 2)
 	default:
 		if !t.hashInsert(sym) {
 			return false
 		}
 	}
-	t.symbols[int(fsstCodeBase)+int(t.nSymbols)] = sym
+	t.symbols[int(codeBase)+int(t.nSymbols)] = sym
 	t.nSymbols++
 	t.lenHisto[length-1]++
 	return true
@@ -122,21 +120,21 @@ func (t *Table) addSymbol(sym symbol) bool {
 
 // findLongestSymbol returns the code for the longest matching symbol.
 func (t *Table) findLongestSymbol(sym symbol) uint16 {
-	idx := sym.hash() & (fsstHashTabSize - 1)
+	idx := sym.hash() & (hashTabSize - 1)
 	entry := t.hashTab[idx]
 	if entry.icl <= sym.icl {
 		mask := ^uint64(0) >> entry.ignoredBits()
 		if entry.val == (sym.val & mask) {
-			return entry.code() & fsstCodeMask
+			return entry.code() & codeMask
 		}
 	}
 	if sym.length() >= 2 {
-		code := t.shortCodes[sym.first2()] & fsstCodeMask
-		if code >= fsstCodeBase {
+		code := t.shortCodes[sym.first2()] & codeMask
+		if code >= codeBase {
 			return code
 		}
 	}
-	return t.byteCodes[sym.first()] & fsstCodeMask
+	return t.byteCodes[sym.first()] & codeMask
 }
 
 // finalize reorders codes by length for encoding efficiency and builds decoder tables.
@@ -159,7 +157,7 @@ func (t *Table) finalize() {
 	// Partition 2-byte symbols by prefix uniqueness
 	conflictCode := int(codeStart[2])
 	for i := range int(t.nSymbols) {
-		sym := t.symbols[int(fsstCodeBase)+i]
+		sym := t.symbols[int(codeBase)+i]
 		length := sym.length()
 
 		if length == 2 {
@@ -167,7 +165,7 @@ func (t *Table) finalize() {
 			first2 := sym.first2()
 			for k := 0; k < int(t.nSymbols); k++ {
 				if k != i {
-					other := t.symbols[int(fsstCodeBase)+k]
+					other := t.symbols[int(codeBase)+k]
 					if other.length() > 1 && other.first2() == first2 {
 						hasConflict = true
 						break
@@ -194,19 +192,19 @@ func (t *Table) finalize() {
 	// Build encoder and decoder lookup tables
 	t.rebuildIndices()
 	t.buildDecoderTables()
-	t.encBuf = make([]byte, fsstChunkSize+fsstChunkPadding)
+	t.encBuf = make([]byte, chunkSize+chunkPadding)
 }
 
 // rebuildIndices reconstructs byteCodes, shortCodes, and hashTab from symbols.
 func (t *Table) rebuildIndices() {
 	// Reset byteCodes to escape
 	for i := range 256 {
-		t.byteCodes[i] = packCodeLength(fsstCodeMask, 1)
+		t.byteCodes[i] = packCodeLength(codeMask, 1)
 	}
 
 	// Clear hash table
-	empty := symbol{val: 0, icl: fsstICLFree}
-	for i := range fsstHashTabSize {
+	empty := symbol{val: 0, icl: iclFree}
+	for i := range hashTabSize {
 		t.hashTab[i] = empty
 	}
 
@@ -220,7 +218,7 @@ func (t *Table) rebuildIndices() {
 
 	// shortCodes mirrors byteCodes for first byte
 	for i := range 65536 {
-		t.shortCodes[i] = t.byteCodes[i&fsstMask8]
+		t.shortCodes[i] = t.byteCodes[i&mask8]
 	}
 
 	// Apply 2-byte symbols
@@ -251,7 +249,7 @@ func (t *Table) buildDecoderTables() {
 
 // WriteTo serializes the Table to w.
 func (t *Table) WriteTo(w io.Writer) (int64, error) {
-	ver := (fsstVersion << 32) |
+	ver := (tableVersion << 32) |
 		(uint64(t.suffixLim) << 16) |
 		(uint64(t.nSymbols) << 8) |
 		1
@@ -312,11 +310,11 @@ func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 	}
 	n += 8
 	ver := binary.LittleEndian.Uint64(hdr[:])
-	if ver>>32 != fsstVersion {
+	if ver>>32 != tableVersion {
 		return n, ErrBadVersion
 	}
-	t.suffixLim = uint16((ver >> 16) & fsstMask8)
-	t.nSymbols = uint16((ver >> 8) & fsstMask8)
+	t.suffixLim = uint16((ver >> 16) & mask8)
+	t.nSymbols = uint16((ver >> 8) & mask8)
 
 	var lh [8]byte
 	if _, err := io.ReadFull(r, lh[:]); err != nil {
@@ -360,7 +358,7 @@ func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 
 	t.rebuildIndices()
 	t.buildDecoderTables()
-	t.encBuf = make([]byte, fsstChunkSize+fsstChunkPadding)
+	t.encBuf = make([]byte, chunkSize+chunkPadding)
 	return n, nil
 }
 
@@ -382,8 +380,8 @@ func (t *Table) UnmarshalBinary(data []byte) error {
 // Encode compresses input, reusing buf if provided.
 // Returns compressed data (may be a different slice than buf).
 func (t *Table) Encode(buf, input []byte) []byte {
-	if buf == nil || cap(buf) < 2*len(input)+fsstOutputPadding {
-		buf = make([]byte, 2*len(input)+fsstOutputPadding)
+	if buf == nil || cap(buf) < 2*len(input)+outputPadding {
+		buf = make([]byte, 2*len(input)+outputPadding)
 	} else {
 		buf = buf[:cap(buf)]
 	}
@@ -394,7 +392,7 @@ func (t *Table) Encode(buf, input []byte) []byte {
 
 	// Process with safe unaligned loads while >=8 bytes remain
 	for position+8 <= inputLen {
-		chunkEnd := min(position+fsstChunkSize, inputLen-7)
+		chunkEnd := min(position+chunkSize, inputLen-7)
 		outPos = t.encodeChunk(buf, outPos, input[position:], chunkEnd-position)
 		position = chunkEnd
 	}
@@ -431,12 +429,12 @@ func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 
 	for position < end {
 		// Load 8 bytes starting at position (safe due to padding guarantee).
-		word := fsstUnalignedLoad(buf[position:])
+		word := unalignedLoad(buf[position:])
 
 		// Tier 1: 2-byte fast path for symbols with unique prefixes.
 		// suffixLim partitions shortCodes: codes below it have unique 2-byte
 		// prefixes and need no further disambiguation.
-		code := t.shortCodes[uint16(word&fsstMask16)]
+		code := t.shortCodes[uint16(word&mask16)]
 		if uint8(code) < suffixLim && position+2 <= end {
 			dst[dstPos] = uint8(code)
 			dstPos++
@@ -445,9 +443,9 @@ func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 		}
 
 		// Tier 2: 3-8 byte hash table lookup (direct-mapped, keyed on first 3 bytes).
-		idx := fsstHash(word&fsstMask24) & (fsstHashTabSize - 1)
+		idx := hashWord(word&mask24) & (hashTabSize - 1)
 		entry := t.hashTab[idx]
-		if entry.icl < fsstICLFree {
+		if entry.icl < iclFree {
 			// Mask off bytes beyond the symbol's length before comparing.
 			mask := ^uint64(0) >> entry.ignoredBits()
 			symLen := int(entry.length())
@@ -461,7 +459,7 @@ func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 
 		// Tier 3: fall back to 2-byte shortCode (if valid) or 1-byte/escape.
 		// The top bits of code encode the advance length (1 or 2).
-		advance := int(code >> fsstLenBits)
+		advance := int(code >> lenBits)
 		if position+advance > end {
 			code = t.byteCodes[uint8(word)]
 			advance = 1
@@ -469,8 +467,8 @@ func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 
 		dst[dstPos] = uint8(code)
 		dstPos++
-		// If code >= fsstCodeBase, this is an escape: emit the literal byte too.
-		if code&fsstCodeBase != 0 {
+		// If code >= codeBase, this is an escape: emit the literal byte too.
+		if code&codeBase != 0 {
 			dst[dstPos] = uint8(word)
 			dstPos++
 		}
@@ -498,7 +496,7 @@ func (t *Table) Decode(buf, src []byte) []byte {
 		code := src[srcPos]
 		srcPos++
 
-		if code < fsstEscapeCode {
+		if code < escapeCode {
 			symLen := int(t.decLen[code])
 			symVal := t.decSymbol[code]
 

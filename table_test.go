@@ -40,7 +40,7 @@ func TestFinalize(t *testing.T) {
 	}
 	// shortCodes for unknown 2-byte pattern must map to byteCodes of first byte
 	sc := tbl.shortCodes[int('Z')<<8|int('Q')]
-	if (sc&fsstCodeMask) >= fsstCodeBase && sc>>fsstLenBits != 1 {
+	if (sc&codeMask) >= codeBase && sc>>lenBits != 1 {
 		t.Fatalf("shortCodes not patched for single byte fallback")
 	}
 }

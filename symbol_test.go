@@ -32,14 +32,14 @@ func TestSymbolBasics(t *testing.T) {
 		t.Fatalf("setCodeLen failed")
 	}
 
-	// fsstConcat truncation
+	// concatSymbols truncation
 	a := newSymbolFromBytes([]byte("abcd"))
 	b2 := newSymbolFromBytes([]byte("WXYZ"))
-	c := fsstConcat(a, b2)
+	c := concatSymbols(a, b2)
 	if c.length() != 8 {
-		t.Fatalf("fsstConcat length=%d", c.length())
+		t.Fatalf("concatSymbols length=%d", c.length())
 	}
 	if c.first() != 'a' {
-		t.Fatalf("fsstConcat content")
+		t.Fatalf("concatSymbols content")
 	}
 }

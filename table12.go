@@ -85,13 +85,11 @@ func newTable12() *Table12 {
 		t.symbols[i] = newSymbolFromByte(byte(i), uint16(i))
 		t.byteCodes[i] = packCodeLength12(uint16(i), 1)
 	}
-	// Mark learned symbol slots as unused
-	unused := symbol{val: 0, icl: fsstICLFree}
+	// Mark remaining symbol slots and hash table as unused
+	empty := symbol{val: 0, icl: iclFree}
 	for i := 256; i < fsst12CodeMax; i++ {
-		t.symbols[i] = unused
+		t.symbols[i] = empty
 	}
-	// Empty hash table
-	empty := symbol{val: 0, icl: fsstICLFree}
 	for i := range fsst12HashSize {
 		t.hashTab[i] = empty
 	}
@@ -109,7 +107,7 @@ func packCodeLength12(code uint16, length int) uint16 {
 // hashInsert12 adds a 3+ byte symbol to the hash table.
 func (t *Table12) hashInsert(sym symbol) bool {
 	idx := sym.hash() & (fsst12HashSize - 1)
-	if t.hashTab[idx].icl < fsstICLFree {
+	if t.hashTab[idx].icl < iclFree {
 		return false
 	}
 	mask := ^uint64(0) >> sym.ignoredBits()
@@ -155,7 +153,7 @@ func (t *Table12) clearSymbols() {
 	for i := range 65536 {
 		t.shortCodes[i] = packCodeLength12(uint16(i&0xFF), 1)
 	}
-	empty := symbol{val: 0, icl: fsstICLFree}
+	empty := symbol{val: 0, icl: iclFree}
 	for i := range fsst12HashSize {
 		t.hashTab[i] = empty
 	}
@@ -188,7 +186,7 @@ func (t *Table12) findLongestSymbol(sym symbol) uint16 {
 func (t *Table12) finalize() {
 	t.rebuildIndices()
 	t.buildDecoderTables()
-	t.encBuf = make([]byte, fsstChunkSize+fsstChunkPadding)
+	t.encBuf = make([]byte, chunkSize+chunkPadding)
 }
 
 func (t *Table12) rebuildIndices() {
@@ -199,7 +197,7 @@ func (t *Table12) rebuildIndices() {
 	for i := range 65536 {
 		t.shortCodes[i] = packCodeLength12(uint16(i&0xFF), 1)
 	}
-	empty := symbol{val: 0, icl: fsstICLFree}
+	empty := symbol{val: 0, icl: iclFree}
 	for i := range fsst12HashSize {
 		t.hashTab[i] = empty
 	}
@@ -262,12 +260,12 @@ func (t *Table12) Encode(buf, input []byte) []byte {
 	for position < inputLen {
 		remaining := inputLen - position
 		if remaining >= 8 {
-			word := fsstUnalignedLoad(input[position:])
+			word := unalignedLoad(input[position:])
 
 			// Try hash table (3-8 bytes)
-			idx := fsstHash(word&fsstMask24) & (fsst12HashSize - 1)
+			idx := hashWord(word&mask24) & (fsst12HashSize - 1)
 			entry := t.hashTab[idx]
-			if entry.icl < fsstICLFree {
+			if entry.icl < iclFree {
 				mask := ^uint64(0) >> entry.ignoredBits()
 				symLen := int(entry.length())
 				if entry.val == (word&mask) && symLen <= remaining {
@@ -278,7 +276,7 @@ func (t *Table12) Encode(buf, input []byte) []byte {
 			}
 
 			// Try 2-byte
-			code := t.shortCodes[uint16(word&fsstMask16)]
+			code := t.shortCodes[uint16(word&mask16)]
 			codeVal := code & 0xFFF
 			codeLen := int(code >> 12)
 			if codeLen == 2 && codeVal >= fsst12CodeBase {
@@ -550,7 +548,7 @@ func (t *Table12) ReadFrom(r io.Reader) (int64, error) {
 
 	t.rebuildIndices()
 	t.buildDecoderTables()
-	t.encBuf = make([]byte, fsstChunkSize+fsstChunkPadding)
+	t.encBuf = make([]byte, chunkSize+chunkPadding)
 	return n, nil
 }
 
@@ -599,7 +597,7 @@ func (c *counters12) incPair(code1, code2 uint32) {
 
 func compressCount12(t *Table12, c *counters12, sample [][]byte, frac int) {
 	for i := range sample {
-		if frac < 128 && int(fsstHash(uint64(i))&fsstSampleMask) > frac {
+		if frac < 128 && int(hashWord(uint64(i))&sampleMask) > frac {
 			continue
 		}
 		data := sample[i]
@@ -654,36 +652,20 @@ type qsym12 struct {
 	gain   uint32
 }
 
-// qsymHeap12 is a min-heap of qsym12 based on gain (with tiebreak on symbol.val).
-// Implements heap.Interface for use with container/heap.
+// qsymHeap12 is a min-heap of qsym12 ordered by ascending gain, breaking ties
+// by larger symbol value for determinism. Implements heap.Interface.
 type qsymHeap12 []qsym12
 
-// Len implements heap.Interface and returns the number of elements.
 func (h qsymHeap12) Len() int { return len(h) }
-
-// Less implements heap.Interface ordering by ascending gain, breaking ties
-// by larger symbol value to keep selection deterministic.
 func (h qsymHeap12) Less(i, j int) bool {
 	if h[i].gain != h[j].gain {
 		return h[i].gain < h[j].gain
 	}
 	return h[i].symbol.val > h[j].symbol.val
 }
-
-// Swap implements heap.Interface swap.
-func (h qsymHeap12) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-
-// Push implements heap.Interface push.
-func (h *qsymHeap12) Push(x any) { *h = append(*h, x.(qsym12)) }
-
-// Pop implements heap.Interface pop.
-func (h *qsymHeap12) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
-}
+func (h qsymHeap12) Swap(i, j int)   { h[i], h[j] = h[j], h[i] }
+func (h *qsymHeap12) Push(x any)     { *h = append(*h, x.(qsym12)) }
+func (h *qsymHeap12) Pop() any       { old := *h; x := old[len(old)-1]; *h = old[:len(old)-1]; return x }
 
 func buildCandidates12(t *Table12, c *counters12, frac int, candidates map[[2]uint64]qsym12, h *qsymHeap12, list *[]qsym12) {
 	clear(candidates)
@@ -749,7 +731,7 @@ func buildCandidates12(t *Table12, c *counters12, frac int, candidates map[[2]ui
 				continue
 			}
 
-			merged := fsstConcat(sym1, sym2)
+			merged := concatSymbols(sym1, sym2)
 			key := [2]uint64{merged.val, uint64(merged.length())}
 			gain := uint32(count) * uint32(merged.length())
 			if existing, ok := candidates[key]; ok {
