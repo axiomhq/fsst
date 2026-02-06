@@ -5,7 +5,6 @@ import (
 	"container/heap"
 	"encoding/binary"
 	"io"
-	"unsafe"
 )
 
 // FSST12 constants
@@ -75,7 +74,7 @@ func Train12(inputs [][]byte) *Table12 {
 func Train12Strings(inputs []string) *Table12 {
 	bytes := make([][]byte, len(inputs))
 	for i := range inputs {
-		bytes[i] = unsafe.Slice(unsafe.StringData(inputs[i]), len(inputs[i]))
+		bytes[i] = []byte(inputs[i])
 	}
 	return Train12(bytes)
 }
@@ -329,16 +328,18 @@ func (t *Table12) Decode(buf, src []byte) []byte {
 	}
 
 	if buf == nil {
-		buf = make([]byte, 0, len(src)*2)
+		buf = make([]byte, len(src)*2+8)
 	} else {
 		buf = buf[:0]
+		if cap(buf) < 8 {
+			buf = make([]byte, len(src)*2+8)
+		} else {
+			buf = buf[:cap(buf)]
+		}
 	}
 
 	bufPos := 0
-	bufCap := cap(buf)
-	if bufCap > 0 {
-		buf = buf[:bufCap]
-	}
+	bufCap := len(buf)
 
 	srcPos := 0
 	srcLen := len(src)
@@ -353,30 +354,28 @@ func (t *Table12) Decode(buf, src []byte) []byte {
 		// Decode first code
 		if c0 < fsst12CodeMax {
 			symLen := int(t.decLen[c0])
-			symVal := t.decSymbol[c0]
-			if bufPos+symLen > bufCap {
-				newCap := max(bufCap*2, bufPos+symLen)
+			if bufPos+8 > bufCap {
+				newCap := max(bufCap*2, bufPos+8)
 				newBuf := make([]byte, newCap)
 				copy(newBuf, buf[:bufPos])
 				buf = newBuf
 				bufCap = newCap
 			}
-			writeSymbol(buf, bufPos, symVal, symLen)
+			binary.LittleEndian.PutUint64(buf[bufPos:], t.decSymbol[c0])
 			bufPos += symLen
 		}
 
 		// Decode second code
 		if c1 < fsst12CodeMax {
 			symLen := int(t.decLen[c1])
-			symVal := t.decSymbol[c1]
-			if bufPos+symLen > bufCap {
-				newCap := max(bufCap*2, bufPos+symLen)
+			if bufPos+8 > bufCap {
+				newCap := max(bufCap*2, bufPos+8)
 				newBuf := make([]byte, newCap)
 				copy(newBuf, buf[:bufPos])
 				buf = newBuf
 				bufCap = newCap
 			}
-			writeSymbol(buf, bufPos, symVal, symLen)
+			binary.LittleEndian.PutUint64(buf[bufPos:], t.decSymbol[c1])
 			bufPos += symLen
 		}
 	}
@@ -387,15 +386,14 @@ func (t *Table12) Decode(buf, src []byte) []byte {
 		c0 := uint16(b0) | (uint16(b1&0x0F) << 8)
 		if c0 < fsst12CodeMax {
 			symLen := int(t.decLen[c0])
-			symVal := t.decSymbol[c0]
-			if bufPos+symLen > bufCap {
-				newCap := max(bufCap*2, bufPos+symLen)
+			if bufPos+8 > bufCap {
+				newCap := max(bufCap*2, bufPos+8)
 				newBuf := make([]byte, newCap)
 				copy(newBuf, buf[:bufPos])
 				buf = newBuf
 				bufCap = newCap
 			}
-			writeSymbol(buf, bufPos, symVal, symLen)
+			binary.LittleEndian.PutUint64(buf[bufPos:], t.decSymbol[c0])
 			bufPos += symLen
 		}
 	}
@@ -406,33 +404,6 @@ func (t *Table12) Decode(buf, src []byte) []byte {
 // DecodeAll decompresses and returns a new slice.
 func (t *Table12) DecodeAll(src []byte) []byte {
 	return t.Decode(nil, src)
-}
-
-// writeSymbol writes a symbol value to buf at pos.
-func writeSymbol(buf []byte, pos int, val uint64, length int) {
-	switch length {
-	case 1:
-		buf[pos] = byte(val)
-	case 2:
-		binary.LittleEndian.PutUint16(buf[pos:], uint16(val))
-	case 3:
-		binary.LittleEndian.PutUint16(buf[pos:], uint16(val))
-		buf[pos+2] = byte(val >> 16)
-	case 4:
-		binary.LittleEndian.PutUint32(buf[pos:], uint32(val))
-	case 5:
-		binary.LittleEndian.PutUint32(buf[pos:], uint32(val))
-		buf[pos+4] = byte(val >> 32)
-	case 6:
-		binary.LittleEndian.PutUint32(buf[pos:], uint32(val))
-		binary.LittleEndian.PutUint16(buf[pos+4:], uint16(val>>32))
-	case 7:
-		binary.LittleEndian.PutUint32(buf[pos:], uint32(val))
-		binary.LittleEndian.PutUint16(buf[pos+4:], uint16(val>>32))
-		buf[pos+6] = byte(val >> 48)
-	case 8:
-		binary.LittleEndian.PutUint64(buf[pos:], val)
-	}
 }
 
 // WriteTo serializes the Table12.

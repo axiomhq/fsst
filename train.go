@@ -2,7 +2,6 @@ package fsst
 
 import (
 	"container/heap"
-	"unsafe"
 )
 
 const (
@@ -282,7 +281,7 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 func TrainStrings(inputs []string) *Table {
 	bytes := make([][]byte, len(inputs))
 	for i := range inputs {
-		bytes[i] = unsafe.Slice(unsafe.StringData(inputs[i]), len(inputs[i]))
+		bytes[i] = []byte(inputs[i])
 	}
 	return Train(bytes)
 }
