@@ -30,9 +30,19 @@ type Table struct {
 	encBuf []byte
 }
 
+// tableVersion identifies the on-disk format for Table serialization.
+//
+// Compatibility policy: the version is checked with an exact match.
+// A reader rejects any version it does not recognize. To evolve the format,
+// define a new version constant and update ReadFrom to accept both the old
+// and new versions, preserving backward compatibility. Writers always emit
+// the latest version.
 const tableVersion uint64 = 20190218
 
-var ErrBadVersion = errors.New("fsst: unsupported table version")
+var (
+	ErrBadVersion = errors.New("fsst: unsupported table version")
+	ErrCorrupted  = errors.New("fsst: corrupted table data")
+)
 
 // newTable creates an initialized empty table.
 func newTable() *Table {
@@ -325,6 +335,15 @@ func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 		t.lenHisto[i] = uint16(lh[i])
 	}
 
+	// Validate lenHisto: sum must equal nSymbols, each length must be 1-8.
+	var histoSum uint16
+	for i := range 8 {
+		histoSum += t.lenHisto[i]
+	}
+	if histoSum != t.nSymbols {
+		return n, ErrCorrupted
+	}
+
 	// Build length schedule
 	lens := make([]uint8, t.nSymbols)
 	pos := 0
@@ -342,6 +361,9 @@ func (t *Table) ReadFrom(r io.Reader) (int64, error) {
 	// Read symbols
 	for i := range int(t.nSymbols) {
 		symbolLength := int(lens[i])
+		if symbolLength < 1 || symbolLength > 8 {
+			return n, ErrCorrupted
+		}
 		var b8 [8]byte
 		if _, err := io.ReadFull(r, b8[:symbolLength]); err != nil {
 			return n, err

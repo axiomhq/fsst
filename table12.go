@@ -16,7 +16,9 @@ const (
 	fsst12MaxSymbols = fsst12CodeMax - 256 // 3840 learnable symbols
 	fsst12HashSize   = 1 << 13             // 8192 entries
 
-	fsst12Version uint64 = 20250116 // FSST12 format version
+	// fsst12Version identifies the on-disk format for Table12 serialization.
+	// See tableVersion in table.go for the compatibility policy.
+	fsst12Version uint64 = 20250116
 )
 
 // Table12 holds a trained FSST12 symbol table.
@@ -505,6 +507,9 @@ func (t *Table12) ReadFrom(r io.Reader) (int64, error) {
 	}
 	n += 2
 	t.nSymbols = binary.LittleEndian.Uint16(buf8[:2])
+	if int(t.nSymbols) > fsst12MaxSymbols {
+		return n, ErrCorrupted
+	}
 
 	// Read lenHisto
 	if _, err := io.ReadFull(r, buf8[:]); err != nil {
@@ -515,21 +520,31 @@ func (t *Table12) ReadFrom(r io.Reader) (int64, error) {
 		t.lenHisto[i] = uint16(buf8[i])
 	}
 
+	// Validate lenHisto: sum must equal nSymbols.
+	var histoSum uint16
+	for i := range 8 {
+		histoSum += t.lenHisto[i]
+	}
+	if histoSum != t.nSymbols {
+		return n, ErrCorrupted
+	}
+
 	// Build length schedule
 	lens := make([]uint8, t.nSymbols)
 	pos := 0
 	for l := 1; l <= 8; l++ {
 		for range int(t.lenHisto[l-1]) {
-			if pos < len(lens) {
-				lens[pos] = uint8(l)
-				pos++
-			}
+			lens[pos] = uint8(l)
+			pos++
 		}
 	}
 
 	// Read symbols
 	for i := uint16(0); i < t.nSymbols; i++ {
 		length := int(lens[i])
+		if length < 1 || length > 8 {
+			return n, ErrCorrupted
+		}
 		if _, err := io.ReadFull(r, buf8[:length]); err != nil {
 			return n, err
 		}
