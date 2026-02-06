@@ -5,7 +5,6 @@ import (
 	"container/heap"
 	"encoding/binary"
 	"io"
-	"unsafe"
 )
 
 // FSST12 constants
@@ -75,7 +74,7 @@ func Train12(inputs [][]byte) *Table12 {
 func Train12Strings(inputs []string) *Table12 {
 	bytes := make([][]byte, len(inputs))
 	for i := range inputs {
-		bytes[i] = unsafe.Slice(unsafe.StringData(inputs[i]), len(inputs[i]))
+		bytes[i] = []byte(inputs[i])
 	}
 	return Train12(bytes)
 }
@@ -362,7 +361,7 @@ func (t *Table12) Decode(buf, src []byte) []byte {
 				buf = newBuf
 				bufCap = newCap
 			}
-			*(*uint64)(unsafe.Pointer(&buf[bufPos])) = t.decSymbol[c0]
+			binary.LittleEndian.PutUint64(buf[bufPos:], t.decSymbol[c0])
 			bufPos += symLen
 		}
 
@@ -376,7 +375,7 @@ func (t *Table12) Decode(buf, src []byte) []byte {
 				buf = newBuf
 				bufCap = newCap
 			}
-			*(*uint64)(unsafe.Pointer(&buf[bufPos])) = t.decSymbol[c1]
+			binary.LittleEndian.PutUint64(buf[bufPos:], t.decSymbol[c1])
 			bufPos += symLen
 		}
 	}
@@ -394,7 +393,7 @@ func (t *Table12) Decode(buf, src []byte) []byte {
 				buf = newBuf
 				bufCap = newCap
 			}
-			*(*uint64)(unsafe.Pointer(&buf[bufPos])) = t.decSymbol[c0]
+			binary.LittleEndian.PutUint64(buf[bufPos:], t.decSymbol[c0])
 			bufPos += symLen
 		}
 	}

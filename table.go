@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"unsafe"
 )
 
 // Table holds a trained symbol table for compression and decompression.
@@ -448,11 +447,10 @@ func (t *Table) EncodeAll(input []byte) []byte {
 func (t *Table) encodeChunk(dst []byte, dstPos int, buf []byte, end int) int {
 	suffixLim := uint8(t.suffixLim)
 	position := 0
-	bufBase := unsafe.Pointer(unsafe.SliceData(buf))
 
 	for position < end {
 		// Load 8 bytes starting at position (safe due to padding guarantee).
-		word := *(*uint64)(unsafe.Add(bufBase, position))
+		word := unalignedLoad(buf[position:])
 
 		// Tier 1: 2-byte fast path for symbols with unique prefixes.
 		// suffixLim partitions shortCodes: codes below it have unique 2-byte
@@ -520,8 +518,6 @@ func (t *Table) Decode(buf, src []byte) []byte {
 	bufPos := 0
 	srcPos := 0
 	bufCap := len(buf)
-	// Ensure the slice backing array is used for unsafe writes.
-	bufPtr := unsafe.Pointer(unsafe.SliceData(buf))
 
 	for srcPos < srcLen {
 		// Fast inner loop: process codes while output buffer has room for
@@ -531,14 +527,17 @@ func (t *Table) Decode(buf, src []byte) []byte {
 			srcPos++
 
 			if code < escapeCode {
-				*(*uint64)(unsafe.Add(bufPtr, bufPos)) = t.decSymbol[code]
+				// Always write 8 bytes; only advance bufPos by the
+				// actual symbol length. Trailing bytes are harmless
+				// and will be overwritten by subsequent symbols.
+				binary.LittleEndian.PutUint64(buf[bufPos:], t.decSymbol[code])
 				bufPos += int(t.decLen[code])
 			} else {
 				// Escape: next byte is literal
 				if srcPos >= srcLen {
 					return buf[:bufPos]
 				}
-				*(*byte)(unsafe.Add(bufPtr, bufPos)) = src[srcPos]
+				buf[bufPos] = src[srcPos]
 				bufPos++
 				srcPos++
 			}
@@ -551,7 +550,6 @@ func (t *Table) Decode(buf, src []byte) []byte {
 			copy(newBuf, buf[:bufPos])
 			buf = newBuf
 			bufCap = newCap
-			bufPtr = unsafe.Pointer(unsafe.SliceData(buf))
 		}
 	}
 	return buf[:bufPos]
@@ -564,5 +562,5 @@ func (t *Table) DecodeAll(src []byte) []byte {
 
 // DecodeString decompresses a string.
 func (t *Table) DecodeString(s string) []byte {
-	return t.Decode(nil, unsafe.Slice(unsafe.StringData(s), len(s)))
+	return t.Decode(nil, []byte(s))
 }
