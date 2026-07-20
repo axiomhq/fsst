@@ -1,0 +1,12 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/axiomhq/fsst
+cpu: Apple M3 Max
+BenchmarkCorpusCompressionSuite/art_of_war.txt/train-16   	    2188	   1094431 ns/op	 1677246 B/op	    6295 allocs/op
+BenchmarkCorpusCompressionSuite/art_of_war.txt/train-16   	    2251	   1069560 ns/op	 1678971 B/op	    6294 allocs/op
+BenchmarkCorpusCompressionSuite/art_of_war.txt/train-16   	    2169	   1078526 ns/op	 1678028 B/op	    6294 allocs/op
+BenchmarkCorpusCompressionSuite/art_of_war.txt/train-16   	    2242	   1077421 ns/op	 1675863 B/op	    6294 allocs/op
+BenchmarkCorpusCompressionSuite/art_of_war.txt/train-16   	    2216	   1084524 ns/op	 1678618 B/op	    6293 allocs/op
+BenchmarkCorpusCompressionSuite/art_of_war.txt/train-16   	    2248	   1075395 ns/op	 1676444 B/op	    6297 allocs/op
+PASS
+ok  	github.com/axiomhq/fsst	14.701s

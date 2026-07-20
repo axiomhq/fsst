@@ -191,6 +191,142 @@ func TestReadFromMalformed(t *testing.T) {
 	})
 }
 
+// TestDecodeBatch tests the batch decode API
+func TestDecodeBatch(t *testing.T) {
+	strings := [][]byte{
+		[]byte("Hello, World!"),
+		[]byte("FSST compression is fast"),
+		[]byte(`{"name":"Alice","age":30}`),
+		[]byte(""),
+		[]byte("x"),
+		[]byte("The quick brown fox jumps over the lazy dog"),
+	}
+
+	tbl := Train(strings)
+
+	// Encode all strings and build concatenated src + offsets
+	var src []byte
+	offsets := []int{0}
+	for _, s := range strings {
+		comp := tbl.EncodeAll(s)
+		src = append(src, comp...)
+		offsets = append(offsets, len(src))
+	}
+
+	t.Run("basic_roundtrip", func(t *testing.T) {
+		dst, dstOffsets, err := tbl.DecodeBatch(nil, nil, src, offsets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(dstOffsets) != len(offsets) {
+			t.Fatalf("expected %d offsets, got %d", len(offsets), len(dstOffsets))
+		}
+		for i, s := range strings {
+			got := dst[dstOffsets[i]:dstOffsets[i+1]]
+			if !bytes.Equal(got, s) {
+				t.Fatalf("string %d: got %q, want %q", i, got, s)
+			}
+		}
+	})
+
+	t.Run("with_buffer", func(t *testing.T) {
+		buf := make([]byte, 1024)
+		offsetsBuf := make([]int, len(offsets))
+		dst, dstOffsets, err := tbl.DecodeBatch(buf, offsetsBuf, src, offsets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, s := range strings {
+			got := dst[dstOffsets[i]:dstOffsets[i+1]]
+			if !bytes.Equal(got, s) {
+				t.Fatalf("string %d: got %q, want %q", i, got, s)
+			}
+		}
+	})
+
+	t.Run("small_buffer_grows", func(t *testing.T) {
+		buf := make([]byte, 4)
+		dst, dstOffsets, err := tbl.DecodeBatch(buf, nil, src, offsets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, s := range strings {
+			got := dst[dstOffsets[i]:dstOffsets[i+1]]
+			if !bytes.Equal(got, s) {
+				t.Fatalf("string %d: got %q, want %q", i, got, s)
+			}
+		}
+	})
+
+	t.Run("empty_batch", func(t *testing.T) {
+		dst, dstOffsets, err := tbl.DecodeBatch(nil, nil, nil, []int{0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(dst) != 0 {
+			t.Fatalf("expected empty dst, got %d bytes", len(dst))
+		}
+		if len(dstOffsets) != 1 {
+			t.Fatalf("expected 1 offset, got %d", len(dstOffsets))
+		}
+	})
+
+	t.Run("single_string", func(t *testing.T) {
+		comp := tbl.EncodeAll(strings[0])
+		dst, dstOffsets, err := tbl.DecodeBatch(nil, nil, comp, []int{0, len(comp)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := dst[dstOffsets[0]:dstOffsets[1]]
+		if !bytes.Equal(got, strings[0]) {
+			t.Fatalf("got %q, want %q", got, strings[0])
+		}
+	})
+
+	t.Run("invalid_offsets", func(t *testing.T) {
+		for _, invalid := range [][]int{nil, {1}, {0, len(src) + 1}, {0, 2, 1}, {0, len(src) - 1}} {
+			if _, _, err := tbl.DecodeBatch(nil, nil, src, invalid); err != ErrCorrupted {
+				t.Fatalf("offsets %v: got %v, want ErrCorrupted", invalid, err)
+			}
+		}
+	})
+
+	t.Run("escape_does_not_cross_string_boundary", func(t *testing.T) {
+		if _, _, err := tbl.DecodeBatch(nil, nil, []byte{escapeCode, 'x'}, []int{0, 1, 2}); err != ErrCorrupted {
+			t.Fatalf("got %v, want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("reuses_buffers", func(t *testing.T) {
+		dst := make([]byte, 0, 1024)
+		dstOffsets := make([]int, 0, len(offsets))
+		allocs := testing.AllocsPerRun(100, func() {
+			var err error
+			dst, dstOffsets, err = tbl.DecodeBatch(dst, dstOffsets, src, offsets)
+			if err != nil {
+				panic(err)
+			}
+		})
+		if allocs != 0 {
+			t.Fatalf("DecodeBatch allocated %v times, want 0", allocs)
+		}
+	})
+
+	t.Run("reuses_source_offsets", func(t *testing.T) {
+		reusedOffsets := append([]int(nil), offsets...)
+		dst, dstOffsets, err := tbl.DecodeBatch(nil, reusedOffsets, src, reusedOffsets)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, s := range strings {
+			got := dst[dstOffsets[i]:dstOffsets[i+1]]
+			if !bytes.Equal(got, s) {
+				t.Fatalf("string %d: got %q, want %q", i, got, s)
+			}
+		}
+	})
+}
+
 // BenchmarkDecode benchmarks different decode scenarios
 func BenchmarkDecode(b *testing.B) {
 	inputs := []struct {
@@ -246,4 +382,76 @@ func BenchmarkDecode(b *testing.B) {
 			}
 		})
 	}
+}
+
+// BenchmarkDecodeBatch compares per-string DecodeAll vs batch decode.
+func BenchmarkDecodeBatch(b *testing.B) {
+	// Generate 1000 strings of varying sizes
+	baseStrings := []string{
+		`{"name":"Alice","age":30,"city":"New York"}`,
+		`{"name":"Bob","age":25,"city":"San Francisco"}`,
+		`{"id":123,"type":"event","ts":"2024-01-15T10:30:00Z"}`,
+		`SELECT * FROM users WHERE active = true`,
+		`https://example.com/api/v2/users?page=1&limit=100`,
+	}
+
+	const numStrings = 1000
+	inputs := make([][]byte, numStrings)
+	for i := range numStrings {
+		inputs[i] = []byte(baseStrings[i%len(baseStrings)])
+	}
+
+	tbl := Train(inputs)
+
+	// Encode all and build batch structures
+	compressed := make([][]byte, numStrings)
+	var batchSrc []byte
+	batchOffsets := make([]int, numStrings+1)
+	var totalDecompressed int64
+	for i, input := range inputs {
+		compressed[i] = tbl.EncodeAll(input)
+		batchOffsets[i] = len(batchSrc)
+		batchSrc = append(batchSrc, compressed[i]...)
+		totalDecompressed += int64(len(input))
+	}
+	batchOffsets[numStrings] = len(batchSrc)
+
+	b.Run("per_string_DecodeAll", func(b *testing.B) {
+		b.SetBytes(totalDecompressed)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for _, c := range compressed {
+				_ = tbl.DecodeAll(c)
+			}
+		}
+	})
+
+	b.Run("per_string_Decode_reuse", func(b *testing.B) {
+		buf := make([]byte, 4096)
+		b.SetBytes(totalDecompressed)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for _, c := range compressed {
+				_ = tbl.Decode(buf, c)
+			}
+		}
+	})
+
+	b.Run("DecodeBatch", func(b *testing.B) {
+		dst := make([]byte, 0, totalDecompressed)
+		dstOffsets := make([]int, 0, len(batchOffsets))
+		var err error
+		b.SetBytes(totalDecompressed)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			dst, dstOffsets, err = tbl.DecodeBatch(dst, dstOffsets, batchSrc, batchOffsets)
+		}
+		b.StopTimer()
+		if err != nil {
+			b.Fatal(err)
+		}
+	})
 }

@@ -316,6 +316,11 @@ func (t *Table12) Encode(buf, input []byte) []byte {
 	return buf[:outPos]
 }
 
+// EncodeInto compresses input while reusing buf.
+func (t *Table12) EncodeInto(buf, input []byte) []byte {
+	return t.Encode(buf, input)
+}
+
 // EncodeAll compresses input and returns a new slice.
 func (t *Table12) EncodeAll(input []byte) []byte {
 	return t.Encode(nil, input)
@@ -399,6 +404,11 @@ func (t *Table12) Decode(buf, src []byte) []byte {
 	}
 
 	return buf[:bufPos]
+}
+
+// DecodeInto decompresses src while reusing buf.
+func (t *Table12) DecodeInto(buf, src []byte) []byte {
+	return t.Decode(buf, src)
 }
 
 // DecodeAll decompresses and returns a new slice.
@@ -594,11 +604,9 @@ func compressCount12(t *Table12, c *counters12, sample [][]byte, frac int) {
 
 		pos := 0
 		cur := t.findLongestSymbol(newSymbolFromBytes(data[pos:min(pos+8, end)]))
-		curLen := int(t.symbols[cur].length())
+		curLen := 1
 		if cur >= fsst12CodeBase {
 			curLen = int(t.symbols[cur].length())
-		} else {
-			curLen = 1
 		}
 		pos += curLen
 		start := 0
@@ -649,9 +657,9 @@ func (h qsymHeap12) Less(i, j int) bool {
 	}
 	return h[i].symbol.val > h[j].symbol.val
 }
-func (h qsymHeap12) Swap(i, j int)   { h[i], h[j] = h[j], h[i] }
-func (h *qsymHeap12) Push(x any)     { *h = append(*h, x.(qsym12)) }
-func (h *qsymHeap12) Pop() any       { old := *h; x := old[len(old)-1]; *h = old[:len(old)-1]; return x }
+func (h qsymHeap12) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *qsymHeap12) Push(x any)   { *h = append(*h, x.(qsym12)) }
+func (h *qsymHeap12) Pop() any     { old := *h; x := old[len(old)-1]; *h = old[:len(old)-1]; return x }
 
 func buildCandidates12(t *Table12, c *counters12, frac int, candidates map[[2]uint64]qsym12, h *qsymHeap12, list *[]qsym12) {
 	clear(candidates)
@@ -761,4 +769,3 @@ func buildCandidates12(t *Table12, c *counters12, frac int, candidates map[[2]ui
 		t.addSymbol((*list)[i].symbol)
 	}
 }
-

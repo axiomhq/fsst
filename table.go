@@ -11,8 +11,8 @@ import (
 // Create with Train or TrainStrings; do not use the zero value.
 type Table struct {
 	// Symbol lookup structures
-	shortCodes [65536]uint16           // 2-byte prefix -> packed [length|code]
-	byteCodes  [256]uint16             // 1-byte -> packed [length|code]
+	shortCodes [65536]uint16       // 2-byte prefix -> packed [length|code]
+	byteCodes  [256]uint16         // 1-byte -> packed [length|code]
 	symbols    [codeMax]symbol     // code -> symbol (for decoding and training)
 	hashTab    [hashTabSize]symbol // direct-mapped 3-8 byte symbols
 
@@ -427,6 +427,12 @@ func (t *Table) Encode(buf, input []byte) []byte {
 	return buf[:outPos]
 }
 
+// EncodeInto compresses input while reusing buf. It is the named-buffer form
+// for integrations that also support the legacy allocating Encode API.
+func (t *Table) EncodeInto(buf, input []byte) []byte {
+	return t.Encode(buf, input)
+}
+
 // EncodeAll compresses input and returns a newly allocated slice.
 func (t *Table) EncodeAll(input []byte) []byte {
 	return t.Encode(nil, input)
@@ -555,9 +561,82 @@ func (t *Table) Decode(buf, src []byte) []byte {
 	return buf[:bufPos]
 }
 
+// DecodeInto decompresses src while reusing buf. It is the named-buffer form
+// for integrations that also support the legacy Decode API.
+func (t *Table) DecodeInto(buf, src []byte) []byte {
+	return t.Decode(buf, src)
+}
+
 // DecodeAll decompresses src and returns a newly allocated slice.
 func (t *Table) DecodeAll(src []byte) []byte {
 	return t.Decode(nil, src)
+}
+
+// DecodeBatch decompresses multiple compressed strings packed contiguously in
+// src. srcOffsets must have n+1 entries where srcOffsets[i] to srcOffsets[i+1]
+// delimits the i-th compressed string. The first offset must be 0 and the last
+// must equal len(src).
+//
+// dst and dstOffsets are reused when they have enough capacity. dstOffsets may
+// be the same slice as srcOffsets; dst must not overlap src. The returned
+// offsets have n+1 entries marking each decompressed string's boundaries.
+//
+// This avoids per-string allocation and function-call overhead, keeping the
+// decoder tables hot in cache across all strings.
+func (t *Table) DecodeBatch(dst []byte, dstOffsets []int, src []byte, srcOffsets []int) ([]byte, []int, error) {
+	dst = dst[:0]
+	dstOffsets = dstOffsets[:0]
+	if len(srcOffsets) == 0 || srcOffsets[0] != 0 {
+		return dst, dstOffsets, ErrCorrupted
+	}
+	previous := 0
+	for _, offset := range srcOffsets[1:] {
+		if offset < previous || offset > len(src) {
+			return dst, dstOffsets, ErrCorrupted
+		}
+		previous = offset
+	}
+	if previous != len(src) {
+		return dst, dstOffsets, ErrCorrupted
+	}
+
+	n := len(srcOffsets) - 1
+	if cap(dstOffsets) < n+1 {
+		dstOffsets = make([]int, n+1)
+	} else {
+		dstOffsets = dstOffsets[:n+1]
+	}
+
+	for i := range n {
+		srcStart, srcEnd := srcOffsets[i], srcOffsets[i+1]
+		dstOffsets[i] = len(dst)
+		for srcPos := srcStart; srcPos < srcEnd; {
+			code := src[srcPos]
+			srcPos++
+			if code < escapeCode {
+				symbolLength := int(t.decLen[code])
+				start := len(dst)
+				if cap(dst)-start >= 8 {
+					dst = dst[:start+8]
+					binary.LittleEndian.PutUint64(dst[start:], t.decSymbol[code])
+					dst = dst[:start+symbolLength]
+					continue
+				}
+				var symbol [8]byte
+				binary.LittleEndian.PutUint64(symbol[:], t.decSymbol[code])
+				dst = append(dst, symbol[:symbolLength]...)
+				continue
+			}
+			if srcPos >= srcEnd {
+				return dst, dstOffsets[:i+1], ErrCorrupted
+			}
+			dst = append(dst, src[srcPos])
+			srcPos++
+		}
+	}
+
+	dstOffsets[n] = len(dst)
+	return dst, dstOffsets, nil
 }
 
 // DecodeString decompresses a string.

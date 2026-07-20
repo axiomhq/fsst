@@ -1,0 +1,15 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/axiomhq/fsst
+cpu: Apple M3 Max
+                                               │ benchmarks/train_a9bc881_before.txt │ benchmarks/train_a9bc881_after.txt │
+                                               │               sec/op                │   sec/op     vs base               │
+CorpusCompressionSuite/art_of_war.txt/train-16                          1078.0µ ± 2%   871.8µ ± 1%  -19.13% (p=0.002 n=6)
+
+                                               │ benchmarks/train_a9bc881_before.txt │ benchmarks/train_a9bc881_after.txt  │
+                                               │                B/op                 │     B/op      vs base               │
+CorpusCompressionSuite/art_of_war.txt/train-16                         1638.3Ki ± 0%   373.7Ki ± 4%  -77.19% (p=0.002 n=6)
+
+                                               │ benchmarks/train_a9bc881_before.txt │ benchmarks/train_a9bc881_after.txt │
+                                               │              allocs/op              │  allocs/op   vs base               │
+CorpusCompressionSuite/art_of_war.txt/train-16                         6294.000 ± 0%    9.500 ± 5%  -99.85% (p=0.002 n=6)

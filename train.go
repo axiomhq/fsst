@@ -1,15 +1,15 @@
 package fsst
 
 import (
-	"container/heap"
+	"sync"
 )
 
 const (
 	// sampleTarget is the target sample size for training (~16KB).
 	// Large enough to capture recurring patterns but small enough to keep
 	// the O(n × 5 iterations) training fast.
-	sampleTarget = 1 << 14 // 16KB
-	sampleMaxSize  = 2 * sampleTarget
+	sampleTarget  = 1 << 14 // 16KB
+	sampleMaxSize = 2 * sampleTarget
 
 	// sampleLine is the slice size when sampling from inputs.
 	// 512 bytes is large enough to capture multi-byte patterns in context
@@ -40,26 +40,50 @@ const (
 // It samples inputs, iteratively parses and counts symbol usage, proposes
 // merged symbols, retains top-gain candidates, and finalizes code layout.
 func Train(inputs [][]byte) *Table {
-	var (
-		sample  = makeSample(inputs)
-		table   = newTable()
-		counter = &counters{}
-		// Reuse allocations across iterations
-		candidates = make(map[[2]uint64]qsym, 512)
-		heap       = make(qsymHeap, 0, maxSymbols+1)
-		list       = make([]qsym, 0, maxSymbols)
-	)
+	sample := makeSample(inputs)
+	table := newTable()
+	workspace := trainingWorkspacePool.Get().(*trainingWorkspace)
+	defer func() {
+		workspace.reset()
+		trainingWorkspacePool.Put(workspace)
+	}()
 
 	for frac := 8; ; frac += 30 {
-		*counter = counters{}
-		compressCount(table, counter, sample, frac)
-		buildCandidates(table, counter, frac, candidates, &heap, &list)
+		workspace.counter.reset()
+		compressCount(table, &workspace.counter, sample, frac)
+		buildCandidates(table, &workspace.counter, frac, workspace.candidates, &workspace.heap, &workspace.list)
 		if frac >= 128 {
 			break
 		}
 	}
 	table.finalize()
 	return table
+}
+
+type trainingWorkspace struct {
+	counter    counters
+	candidates map[[2]uint64]qsym
+	heap       qsymHeap
+	list       []qsym
+}
+
+func newTrainingWorkspace() *trainingWorkspace {
+	return &trainingWorkspace{
+		candidates: make(map[[2]uint64]qsym, 512),
+		heap:       make(qsymHeap, 0, maxSymbols+1),
+		list:       make([]qsym, 0, maxSymbols),
+	}
+}
+
+func (w *trainingWorkspace) reset() {
+	w.counter.reset()
+	clear(w.candidates)
+	w.heap = w.heap[:0]
+	w.list = w.list[:0]
+}
+
+var trainingWorkspacePool = sync.Pool{
+	New: func() any { return newTrainingWorkspace() },
 }
 
 // findNextSymbolFast returns the best match at data[position:] using the
@@ -157,7 +181,7 @@ type qsym struct {
 }
 
 // qsymHeap is a min-heap of qsym ordered by ascending gain, breaking ties
-// by larger symbol value for determinism. Implements heap.Interface.
+// by larger symbol value for determinism.
 type qsymHeap []qsym
 
 func (h qsymHeap) Len() int { return len(h) }
@@ -167,9 +191,50 @@ func (h qsymHeap) Less(i, j int) bool {
 	}
 	return h[i].symbol.val > h[j].symbol.val
 }
-func (h qsymHeap) Swap(i, j int)   { h[i], h[j] = h[j], h[i] }
-func (h *qsymHeap) Push(x any)     { *h = append(*h, x.(qsym)) }
-func (h *qsymHeap) Pop() any       { old := *h; x := old[len(old)-1]; *h = old[:len(old)-1]; return x }
+func (h qsymHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *qsymHeap) push(value qsym) {
+	*h = append(*h, value)
+	for child := len(*h) - 1; child > 0; {
+		parent := (child - 1) / 2
+		if !h.Less(child, parent) {
+			break
+		}
+		h.Swap(parent, child)
+		child = parent
+	}
+}
+
+func (h *qsymHeap) pop() qsym {
+	last := len(*h) - 1
+	h.Swap(0, last)
+	value := (*h)[last]
+	(*h)[last] = qsym{}
+	*h = (*h)[:last]
+	if last > 0 {
+		h.down(0)
+	}
+	return value
+}
+
+func (h *qsymHeap) down(parent int) {
+	for {
+		left := 2*parent + 1
+		if left >= len(*h) {
+			return
+		}
+		child := left
+		right := left + 1
+		if right < len(*h) && h.Less(right, left) {
+			child = right
+		}
+		if !h.Less(child, parent) {
+			return
+		}
+		h.Swap(parent, child)
+		parent = child
+	}
+}
 
 // buildCandidates selects the best symbol candidates from the frequency
 // counters and installs them into the table for the next iteration.
@@ -242,16 +307,15 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 	// Use min-heap to efficiently select top maxSymbols candidates
 	// This is O(n log k) instead of O(n log n) where k=255, n=candidates
 	*h = (*h)[:0] // Reuse heap, clear contents
-	heap.Init(h)
 
 	for _, candidate := range candidates {
 		if len(*h) < maxSymbols {
-			heap.Push(h, candidate)
+			h.push(candidate)
 		} else if candidate.gain > (*h)[0].gain ||
 			(candidate.gain == (*h)[0].gain && candidate.symbol.val < (*h)[0].symbol.val) {
 			// Replace minimum with this better candidate
-			heap.Pop(h)
-			heap.Push(h, candidate)
+			h.pop()
+			h.push(candidate)
 		}
 	}
 
@@ -263,7 +327,7 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 		*list = (*list)[:len(*h)]
 	}
 	for i := len(*h) - 1; i >= 0; i-- {
-		(*list)[i] = heap.Pop(h).(qsym)
+		(*list)[i] = h.pop()
 	}
 
 	// Reverse to get descending order (heap gave us ascending)

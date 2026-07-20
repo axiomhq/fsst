@@ -7,11 +7,17 @@ package fsst
 //   - Pair counts: 16-bit counters for each (code1, code2) pair
 //   - Sparse pair tracking: list of non-zero pairs for fast iteration
 //
-// Total size: ~520KB (acceptable for training phase, discarded after).
+// Total size: ~520KB, retained in a pooled training workspace between calls.
 type counters struct {
-	single   [codeMax]uint16              // Single-symbol counts
+	single   [codeMax]uint16          // Single-symbol counts
 	pair     [codeMax][codeMax]uint16 // Pair counts
-	pairList [][2]uint32                      // Sparse list of non-zero pairs
+	pairList [][2]uint32              // Sparse list of non-zero pairs
+}
+
+func (c *counters) reset() {
+	c.single = [codeMax]uint16{}
+	c.pair = [codeMax][codeMax]uint16{}
+	c.pairList = c.pairList[:0]
 }
 
 // incSingle increments the frequency count for a single symbol.
