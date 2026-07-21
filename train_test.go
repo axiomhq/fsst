@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -27,6 +28,69 @@ func TestTrainDeterministic(t *testing.T) {
 	}
 	if !bytes.Equal(b1.Bytes(), b2.Bytes()) {
 		t.Fatalf("deterministic training violated: headers differ")
+	}
+}
+
+func TestTrainDeterministicManyCandidates(t *testing.T) {
+	inputs := make([][]byte, 1024)
+	for i := range inputs {
+		token := strconv.AppendInt(nil, int64(i), 10)
+		row := make([]byte, 0, 256)
+		for range 8 {
+			row = append(row, "field_"...)
+			row = append(row, token...)
+			row = append(row, "=value_"...)
+			row = append(row, token...)
+			row = append(row, ';')
+		}
+		inputs[i] = row
+	}
+
+	var want []byte
+	for range 8 {
+		tbl := Train(inputs)
+		var buf bytes.Buffer
+		if _, err := tbl.WriteTo(&buf); err != nil {
+			t.Fatalf("write table: %v", err)
+		}
+		if want == nil {
+			want = bytes.Clone(buf.Bytes())
+			continue
+		}
+		if !bytes.Equal(want, buf.Bytes()) {
+			t.Fatal("deterministic training violated with more candidates than the symbol limit")
+		}
+	}
+}
+
+func TestSelectCandidatesKeepsStrongestInDescendingOrder(t *testing.T) {
+	const extraCandidates = 100
+	candidates := make(map[[2]uint64]qsym, maxCandidateSymbols+extraCandidates)
+	for i := range maxCandidateSymbols + extraCandidates {
+		sym := newSymbolFromBytes([]byte{byte(i), byte(i >> 8)})
+		candidates[[2]uint64{sym.val, uint64(sym.length())}] = qsym{
+			symbol: sym,
+			gain:   uint32(i),
+		}
+	}
+
+	heap := make(qsymHeap, 0, maxCandidateSymbols)
+	list := make([]qsym, 0, maxCandidateSymbols)
+	selectCandidates(candidates, &heap, &list)
+
+	if len(list) != maxCandidateSymbols {
+		t.Fatalf("selected %d candidates, want %d", len(list), maxCandidateSymbols)
+	}
+	if got, want := list[0].gain, uint32(maxCandidateSymbols+extraCandidates-1); got != want {
+		t.Fatalf("strongest gain is %d, want %d", got, want)
+	}
+	if got, want := list[len(list)-1].gain, uint32(extraCandidates); got != want {
+		t.Fatalf("weakest selected gain is %d, want %d", got, want)
+	}
+	for i := 1; i < len(list); i++ {
+		if list[i].betterThan(list[i-1]) {
+			t.Fatalf("candidate %d is stronger than predecessor", i)
+		}
 	}
 }
 

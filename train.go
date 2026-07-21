@@ -1,8 +1,6 @@
 package fsst
 
-import (
-	"sync"
-)
+import "sync"
 
 const (
 	// sampleTarget is the target sample size for training (~16KB).
@@ -34,6 +32,11 @@ const (
 	// A fixed seed ensures deterministic, reproducible training: the same
 	// input always produces the same symbol table.
 	rngSeed = 4637947
+
+	// Keep enough ranked candidates to replace symbols rejected by hash-table
+	// collisions. Limiting the heap to maxSymbols can leave the table partially
+	// filled and materially degrade compression.
+	maxCandidateSymbols = maxSymbols * 2
 )
 
 // Train builds and finalizes a compression Table from the provided corpora.
@@ -70,8 +73,8 @@ type trainingWorkspace struct {
 func newTrainingWorkspace() *trainingWorkspace {
 	return &trainingWorkspace{
 		candidates: make(map[[2]uint64]qsym, 512),
-		heap:       make(qsymHeap, 0, maxSymbols+1),
-		list:       make([]qsym, 0, maxSymbols),
+		heap:       make(qsymHeap, 0, maxCandidateSymbols+1),
+		list:       make([]qsym, 0, maxCandidateSymbols),
 	}
 }
 
@@ -180,18 +183,22 @@ type qsym struct {
 	gain   uint32
 }
 
-// qsymHeap is a min-heap of qsym ordered by ascending gain, breaking ties
-// by larger symbol value for determinism.
+func (q qsym) betterThan(other qsym) bool {
+	if q.gain != other.gain {
+		return q.gain > other.gain
+	}
+	if q.symbol.val != other.symbol.val {
+		return q.symbol.val < other.symbol.val
+	}
+	return q.symbol.length() < other.symbol.length()
+}
+
+// qsymHeap is a min-heap with the weakest candidate at its root.
 type qsymHeap []qsym
 
-func (h qsymHeap) Len() int { return len(h) }
-func (h qsymHeap) Less(i, j int) bool {
-	if h[i].gain != h[j].gain {
-		return h[i].gain < h[j].gain
-	}
-	return h[i].symbol.val > h[j].symbol.val
-}
-func (h qsymHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h qsymHeap) Len() int           { return len(h) }
+func (h qsymHeap) Less(i, j int) bool { return h[j].betterThan(h[i]) }
+func (h qsymHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 
 func (h *qsymHeap) push(value qsym) {
 	*h = append(*h, value)
@@ -246,11 +253,12 @@ func (h *qsymHeap) down(parent int) {
 //  2. Score merged pairs (early rounds only): concatenate each observed
 //     (sym1, sym2) pair into a candidate up to 8 bytes, scored the same way.
 //     This is how multi-byte symbols grow across iterations.
-//  3. Top-K selection via min-heap: keep the maxSymbols (255) highest-gain
-//     candidates. The min-heap root always holds the weakest candidate, so
-//     replacements are O(log k). The final list is extracted in descending order.
+//  3. Keep the best candidates in a min-heap, including enough extras to
+//     backfill symbols rejected by hash-table collisions. Extracting the heap
+//     from weakest to strongest directly into the list's tail leaves the list
+//     in descending rank order.
 //
-// All map/heap/list arguments are reused across iterations to reduce GC pressure.
+// The map, heap, and list are reused across iterations to reduce GC pressure.
 func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]qsym, h *qsymHeap, list *[]qsym) {
 	// Clear candidates map for reuse (clear() is more efficient than delete loop)
 	clear(candidates)
@@ -304,23 +312,25 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 		}
 	}
 
-	// Use min-heap to efficiently select top maxSymbols candidates
-	// This is O(n log k) instead of O(n log n) where k=255, n=candidates
-	*h = (*h)[:0] // Reuse heap, clear contents
+	selectCandidates(candidates, h, list)
 
+	t.clearSymbols()
+	for i := 0; i < len(*list) && int(t.nSymbols) < maxSymbols; i++ {
+		t.addSymbol((*list)[i].symbol)
+	}
+}
+
+func selectCandidates(candidates map[[2]uint64]qsym, h *qsymHeap, list *[]qsym) {
+	*h = (*h)[:0]
 	for _, candidate := range candidates {
-		if len(*h) < maxSymbols {
+		if len(*h) < maxCandidateSymbols {
 			h.push(candidate)
-		} else if candidate.gain > (*h)[0].gain ||
-			(candidate.gain == (*h)[0].gain && candidate.symbol.val < (*h)[0].symbol.val) {
-			// Replace minimum with this better candidate
+		} else if candidate.betterThan((*h)[0]) {
 			h.pop()
 			h.push(candidate)
 		}
 	}
 
-	// Extract and sort the top-K (small enough to sort efficiently)
-	*list = (*list)[:0] // Reuse list, clear contents
 	if cap(*list) < len(*h) {
 		*list = make([]qsym, len(*h))
 	} else {
@@ -328,16 +338,6 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 	}
 	for i := len(*h) - 1; i >= 0; i-- {
 		(*list)[i] = h.pop()
-	}
-
-	// Reverse to get descending order (heap gave us ascending)
-	for i, j := 0, len(*list)-1; i < j; i, j = i+1, j-1 {
-		(*list)[i], (*list)[j] = (*list)[j], (*list)[i]
-	}
-
-	t.clearSymbols()
-	for i := 0; i < len(*list) && int(t.nSymbols) < maxSymbols; i++ {
-		t.addSymbol((*list)[i].symbol)
 	}
 }
 
