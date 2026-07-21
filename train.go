@@ -326,8 +326,8 @@ func selectCandidates(candidates map[[2]uint64]qsym, h *qsymHeap, list *[]qsym) 
 		if len(*h) < maxCandidateSymbols {
 			h.push(candidate)
 		} else if candidate.betterThan((*h)[0]) {
-			h.pop()
-			h.push(candidate)
+			(*h)[0] = candidate
+			h.down(0)
 		}
 	}
 
