@@ -16,7 +16,9 @@ type counters struct {
 
 func (c *counters) reset() {
 	c.single = [codeMax]uint16{}
-	c.pair = [codeMax][codeMax]uint16{}
+	for _, pair := range c.pairList {
+		c.pair[pair[0]][pair[1]] = 0
+	}
 	c.pairList = c.pairList[:0]
 }
 

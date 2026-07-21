@@ -509,8 +509,9 @@ func (t *Table) Decode(buf, src []byte) []byte {
 	srcLen := len(src)
 	// Worst case: every code is an escape (2 src bytes → 1 output byte),
 	// best case: every code is an 8-byte symbol (1 src byte → 8 output bytes).
-	// Use 4x+8 as a reasonable estimate that avoids regrowth for most inputs.
-	needed := srcLen*4 + 8
+	// Use 2x+8 as a reasonable estimate that limits over-allocation while
+	// avoiding regrowth for typical inputs.
+	needed := srcLen*2 + 8
 	if buf == nil {
 		buf = make([]byte, needed)
 	} else {
@@ -536,7 +537,7 @@ func (t *Table) Decode(buf, src []byte) []byte {
 				// Always write 8 bytes; only advance bufPos by the
 				// actual symbol length. Trailing bytes are harmless
 				// and will be overwritten by subsequent symbols.
-				binary.LittleEndian.PutUint64(buf[bufPos:], t.decSymbol[code])
+				binary.LittleEndian.PutUint64(buf[bufPos:bufPos+8], t.decSymbol[code])
 				bufPos += int(t.decLen[code])
 			} else {
 				// Escape: next byte is literal
@@ -618,7 +619,7 @@ func (t *Table) DecodeBatch(dst []byte, dstOffsets []int, src []byte, srcOffsets
 				start := len(dst)
 				if cap(dst)-start >= 8 {
 					dst = dst[:start+8]
-					binary.LittleEndian.PutUint64(dst[start:], t.decSymbol[code])
+					binary.LittleEndian.PutUint64(dst[start:start+8], t.decSymbol[code])
 					dst = dst[:start+symbolLength]
 					continue
 				}

@@ -47,3 +47,28 @@ func TestCountersBasic(t *testing.T) {
 		t.Fatalf("high count failed: expected 300, got %d", got)
 	}
 }
+
+func TestCountersReset(t *testing.T) {
+	var c counters
+	c.incSingle(7)
+	c.incPair(3, 4)
+	c.incPair(3, 4)
+	c.incPair(8, 9)
+
+	c.reset()
+
+	if c.single[7] != 0 {
+		t.Fatalf("single count survived reset: %d", c.single[7])
+	}
+	if c.pair[3][4] != 0 || c.pair[8][9] != 0 {
+		t.Fatalf("pair count survived reset: %d, %d", c.pair[3][4], c.pair[8][9])
+	}
+	if len(c.pairList) != 0 {
+		t.Fatalf("pair list length after reset: %d", len(c.pairList))
+	}
+
+	c.incPair(3, 4)
+	if c.pair[3][4] != 1 || len(c.pairList) != 1 {
+		t.Fatalf("counter not reusable after reset: count=%d list=%d", c.pair[3][4], len(c.pairList))
+	}
+}
