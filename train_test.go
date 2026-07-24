@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -64,7 +65,7 @@ func TestTrainDeterministicManyCandidates(t *testing.T) {
 }
 
 func TestSelectCandidatesKeepsStrongestInDescendingOrder(t *testing.T) {
-	const extraCandidates = 100
+	const extraCandidates = maxCandidateSymbols * 3
 	candidates := make(map[[2]uint64]qsym, maxCandidateSymbols+extraCandidates)
 	for i := range maxCandidateSymbols + extraCandidates {
 		sym := newSymbolFromBytes([]byte{byte(i), byte(i >> 8)})
@@ -74,9 +75,8 @@ func TestSelectCandidatesKeepsStrongestInDescendingOrder(t *testing.T) {
 		}
 	}
 
-	heap := make(qsymHeap, 0, maxCandidateSymbols)
-	list := make([]qsym, 0, maxCandidateSymbols)
-	selectCandidates(candidates, &heap, &list)
+	var scratch [maxCandidateSymbols * 2]qsym
+	list := selectCandidates(candidates, &scratch)
 
 	if len(list) != maxCandidateSymbols {
 		t.Fatalf("selected %d candidates, want %d", len(list), maxCandidateSymbols)
@@ -92,6 +92,46 @@ func TestSelectCandidatesKeepsStrongestInDescendingOrder(t *testing.T) {
 			t.Fatalf("candidate %d is stronger than predecessor", i)
 		}
 	}
+
+	t.Run("ties at cutoff", func(t *testing.T) {
+		const extraTies = 32
+		candidates := make(map[[2]uint64]qsym, maxCandidateSymbols+extraTies+1)
+		for i := range maxCandidateSymbols + extraTies {
+			sym := newSymbolFromBytes([]byte{byte(i), byte(i >> 8)})
+			candidates[[2]uint64{sym.val, uint64(sym.length())}] = qsym{
+				symbol: sym,
+				// 48 is realizable for both the two-byte candidates (24 counts)
+				// and the three-byte tie at the retention cutoff (16 counts).
+				gain: 48,
+			}
+		}
+		cutoff := maxCandidateSymbols - 1
+		tie := newSymbolFromBytes([]byte{byte(cutoff), byte(cutoff >> 8), 0})
+		candidates[[2]uint64{tie.val, uint64(tie.length())}] = qsym{symbol: tie, gain: 48}
+
+		expected := make([]qsym, 0, len(candidates))
+		for _, candidate := range candidates {
+			expected = append(expected, candidate)
+		}
+		sort.Slice(expected, func(i, j int) bool {
+			return expected[i].betterThan(expected[j])
+		})
+		expected = expected[:maxCandidateSymbols]
+
+		var scratch [maxCandidateSymbols * 2]qsym
+		list := selectCandidates(candidates, &scratch)
+		if len(list) != len(expected) {
+			t.Fatalf("selected %d candidates, want %d", len(list), len(expected))
+		}
+		for i := range expected {
+			if list[i] != expected[i] {
+				t.Fatalf("candidate %d = %+v, want %+v", i, list[i], expected[i])
+			}
+		}
+		if got := list[len(list)-1]; got.symbol.val != uint64(cutoff) || got.symbol.length() != 2 {
+			t.Fatalf("cutoff candidate = value %#x, length %d; want value %#x, length 2", got.symbol.val, got.symbol.length(), cutoff)
+		}
+	})
 }
 
 func TestTrainEncodeDecode(t *testing.T) {

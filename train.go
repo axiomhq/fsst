@@ -1,6 +1,9 @@
 package fsst
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
 const (
 	// sampleTarget is the target sample size for training (~16KB).
@@ -34,8 +37,8 @@ const (
 	rngSeed = 4637947
 
 	// Keep enough ranked candidates to replace symbols rejected by hash-table
-	// collisions. Limiting the heap to maxSymbols can leave the table partially
-	// filled and materially degrade compression.
+	// collisions. Retaining only maxSymbols candidates can leave the table
+	// partially filled and materially degrade compression.
 	maxCandidateSymbols = maxSymbols * 2
 )
 
@@ -54,7 +57,7 @@ func Train(inputs [][]byte) *Table {
 	for frac := 8; ; frac += 30 {
 		workspace.counter.reset()
 		compressCount(table, &workspace.counter, sample, frac)
-		buildCandidates(table, &workspace.counter, frac, workspace.candidates, &workspace.heap, &workspace.list)
+		buildCandidates(table, &workspace.counter, frac, workspace.candidates, &workspace.scratch)
 		if frac >= 128 {
 			break
 		}
@@ -66,23 +69,18 @@ func Train(inputs [][]byte) *Table {
 type trainingWorkspace struct {
 	counter    counters
 	candidates map[[2]uint64]qsym
-	heap       qsymHeap
-	list       []qsym
+	scratch    [maxCandidateSymbols * 2]qsym
 }
 
 func newTrainingWorkspace() *trainingWorkspace {
 	return &trainingWorkspace{
 		candidates: make(map[[2]uint64]qsym, 512),
-		heap:       make(qsymHeap, 0, maxCandidateSymbols+1),
-		list:       make([]qsym, 0, maxCandidateSymbols),
 	}
 }
 
 func (w *trainingWorkspace) reset() {
 	w.counter.reset()
 	clear(w.candidates)
-	w.heap = w.heap[:0]
-	w.list = w.list[:0]
 }
 
 var trainingWorkspacePool = sync.Pool{
@@ -193,54 +191,67 @@ func (q qsym) betterThan(other qsym) bool {
 	return q.symbol.length() < other.symbol.length()
 }
 
-// qsymHeap is a min-heap with the weakest candidate at its root.
-type qsymHeap []qsym
+func compareQsym(a, b qsym) int {
+	if a.betterThan(b) {
+		return -1
+	}
+	if b.betterThan(a) {
+		return 1
+	}
+	return 0
+}
 
-func (h qsymHeap) Len() int           { return len(h) }
-func (h qsymHeap) Less(i, j int) bool { return h[j].betterThan(h[i]) }
-func (h qsymHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-
-func (h *qsymHeap) push(value qsym) {
-	*h = append(*h, value)
-	for child := len(*h) - 1; child > 0; {
-		parent := (child - 1) / 2
-		if !h.Less(child, parent) {
-			break
+// partitionTopCandidates moves the strongest maxCandidateSymbols candidates
+// into the prefix without fully ordering the remaining candidates.
+func partitionTopCandidates(candidates []qsym) {
+	target := maxCandidateSymbols - 1
+	left, right := 0, len(candidates)-1
+	for left < right {
+		pivot := candidates[left+(right-left)/2]
+		i, j := left, right
+		for i <= j {
+			for candidates[i].betterThan(pivot) {
+				i++
+			}
+			for pivot.betterThan(candidates[j]) {
+				j--
+			}
+			if i <= j {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+				i++
+				j--
+			}
 		}
-		h.Swap(parent, child)
-		child = parent
+		switch {
+		case target <= j:
+			right = j
+		case target >= i:
+			left = i
+		default:
+			return
+		}
 	}
 }
 
-func (h *qsymHeap) pop() qsym {
-	last := len(*h) - 1
-	h.Swap(0, last)
-	value := (*h)[last]
-	(*h)[last] = qsym{}
-	*h = (*h)[:last]
-	if last > 0 {
-		h.down(0)
+// selectCandidates keeps candidates in bounded reusable storage, retaining the
+// strongest maxCandidateSymbols values before sorting only that prefix.
+func selectCandidates(candidates map[[2]uint64]qsym, scratch *[maxCandidateSymbols * 2]qsym) []qsym {
+	n := 0
+	for _, candidate := range candidates {
+		if n == len(scratch) {
+			partitionTopCandidates(scratch[:n])
+			n = maxCandidateSymbols
+		}
+		scratch[n] = candidate
+		n++
 	}
-	return value
-}
-
-func (h *qsymHeap) down(parent int) {
-	for {
-		left := 2*parent + 1
-		if left >= len(*h) {
-			return
-		}
-		child := left
-		right := left + 1
-		if right < len(*h) && h.Less(right, left) {
-			child = right
-		}
-		if !h.Less(child, parent) {
-			return
-		}
-		h.Swap(parent, child)
-		parent = child
+	if n > maxCandidateSymbols {
+		partitionTopCandidates(scratch[:n])
+		n = maxCandidateSymbols
 	}
+	selected := scratch[:n]
+	slices.SortFunc(selected, compareQsym)
+	return selected
 }
 
 // buildCandidates selects the best symbol candidates from the frequency
@@ -253,13 +264,12 @@ func (h *qsymHeap) down(parent int) {
 //  2. Score merged pairs (early rounds only): concatenate each observed
 //     (sym1, sym2) pair into a candidate up to 8 bytes, scored the same way.
 //     This is how multi-byte symbols grow across iterations.
-//  3. Keep the best candidates in a min-heap, including enough extras to
-//     backfill symbols rejected by hash-table collisions. Extracting the heap
-//     from weakest to strongest directly into the list's tail leaves the list
-//     in descending rank order.
+//  3. Keep the strongest candidates in bounded reusable scratch storage,
+//     periodically partitioning to retain the best prefix before sorting only
+//     that prefix in descending rank order.
 //
-// The map, heap, and list are reused across iterations to reduce GC pressure.
-func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]qsym, h *qsymHeap, list *[]qsym) {
+// The map and scratch storage are reused across iterations to reduce GC pressure.
+func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]qsym, scratch *[maxCandidateSymbols * 2]qsym) {
 	// Clear candidates map for reuse (clear() is more efficient than delete loop)
 	clear(candidates)
 	minCount := max((minCountNumerator*frac)/minCountDenominator, 1)
@@ -312,32 +322,11 @@ func buildCandidates(t *Table, c *counters, frac int, candidates map[[2]uint64]q
 		}
 	}
 
-	selectCandidates(candidates, h, list)
+	selected := selectCandidates(candidates, scratch)
 
 	t.clearSymbols()
-	for i := 0; i < len(*list) && int(t.nSymbols) < maxSymbols; i++ {
-		t.addSymbol((*list)[i].symbol)
-	}
-}
-
-func selectCandidates(candidates map[[2]uint64]qsym, h *qsymHeap, list *[]qsym) {
-	*h = (*h)[:0]
-	for _, candidate := range candidates {
-		if len(*h) < maxCandidateSymbols {
-			h.push(candidate)
-		} else if candidate.betterThan((*h)[0]) {
-			(*h)[0] = candidate
-			h.down(0)
-		}
-	}
-
-	if cap(*list) < len(*h) {
-		*list = make([]qsym, len(*h))
-	} else {
-		*list = (*list)[:len(*h)]
-	}
-	for i := len(*h) - 1; i >= 0; i-- {
-		(*list)[i] = h.pop()
+	for i := 0; i < len(selected) && int(t.nSymbols) < maxSymbols; i++ {
+		t.addSymbol(selected[i].symbol)
 	}
 }
 
