@@ -249,6 +249,10 @@ func (t *Table) rebuildIndices() {
 
 // buildDecoderTables populates the flat decLen/decSymbol arrays.
 func (t *Table) buildDecoderTables() {
+	// A zero length marks codes outside the current table as invalid for the
+	// strict decoder, including when a Table is rebuilt with fewer symbols.
+	clear(t.decLen[:])
+	clear(t.decSymbol[:])
 	for code := uint16(0); code < t.nSymbols; code++ {
 		sym := t.symbols[code]
 		t.decLen[code] = byte(sym.length())
@@ -566,6 +570,65 @@ func (t *Table) Decode(buf, src []byte) []byte {
 // for integrations that also support the legacy Decode API.
 func (t *Table) DecodeInto(buf, src []byte) []byte {
 	return t.Decode(buf, src)
+}
+
+// DecodeIntoExact decompresses src into caller-provided storage and requires
+// the decoded output to contain exactly decodedLen bytes. The existing length
+// of buf is ignored; its capacity must be at least decodedLen. DecodeIntoExact
+// does not allocate and src must not overlap buf.
+//
+// It returns io.ErrShortBuffer when buf is too small and ErrCorrupted when src
+// is malformed or its decoded length does not equal decodedLen.
+func (t *Table) DecodeIntoExact(buf, src []byte, decodedLen int) ([]byte, error) {
+	if decodedLen < 0 {
+		return buf[:0], ErrCorrupted
+	}
+	if cap(buf) < decodedLen {
+		return buf[:0], io.ErrShortBuffer
+	}
+
+	dst := buf[:decodedLen]
+	n, err := t.decodeIntoExactKernel(dst, src)
+	if err != nil || n != decodedLen {
+		return buf[:0], ErrCorrupted
+	}
+	return dst, nil
+}
+
+// decodeIntoExactSafe is the portable exact-size decoder and reference
+// implementation. It never writes beyond len(dst).
+func (t *Table) decodeIntoExactSafe(dst, src []byte) (int, error) {
+	dstPos := 0
+	for srcPos := 0; srcPos < len(src); {
+		code := src[srcPos]
+		srcPos++
+		if code == escapeCode {
+			if srcPos >= len(src) || dstPos >= len(dst) {
+				return 0, ErrCorrupted
+			}
+			dst[dstPos] = src[srcPos]
+			dstPos++
+			srcPos++
+			continue
+		}
+		if uint16(code) >= t.nSymbols {
+			return 0, ErrCorrupted
+		}
+
+		symbolLen := int(t.decLen[code])
+		if symbolLen == 0 || symbolLen > len(dst)-dstPos {
+			return 0, ErrCorrupted
+		}
+		if len(dst)-dstPos >= 8 {
+			binary.LittleEndian.PutUint64(dst[dstPos:dstPos+8], t.decSymbol[code])
+		} else {
+			var symbol [8]byte
+			binary.LittleEndian.PutUint64(symbol[:], t.decSymbol[code])
+			copy(dst[dstPos:], symbol[:symbolLen])
+		}
+		dstPos += symbolLen
+	}
+	return dstPos, nil
 }
 
 // DecodeAll decompresses src and returns a newly allocated slice.
