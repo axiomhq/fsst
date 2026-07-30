@@ -595,6 +595,29 @@ func (t *Table) DecodeIntoExact(buf, src []byte, decodedLen int) ([]byte, error)
 	return dst, nil
 }
 
+// DecodeIntoExactTrusted is DecodeIntoExact for a code stream that was
+// already validated against t. It skips the code-validity pass, but still
+// checks the decoded size and never reads or writes outside src or buf.
+//
+// This is intended for storage readers that validate immutable encoded pages
+// once when loading them and decode the same page repeatedly. Callers must not
+// mutate src after validation.
+func (t *Table) DecodeIntoExactTrusted(buf, src []byte, decodedLen int) ([]byte, error) {
+	if decodedLen < 0 {
+		return buf[:0], ErrCorrupted
+	}
+	if cap(buf) < decodedLen {
+		return buf[:0], io.ErrShortBuffer
+	}
+
+	dst := buf[:decodedLen]
+	n, err := t.decodeIntoExactTrustedKernel(dst, src)
+	if err != nil || n != decodedLen {
+		return buf[:0], ErrCorrupted
+	}
+	return dst, nil
+}
+
 // decodeIntoExactSafe is the portable exact-size decoder and reference
 // implementation. It never writes beyond len(dst).
 func (t *Table) decodeIntoExactSafe(dst, src []byte) (int, error) {

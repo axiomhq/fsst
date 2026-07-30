@@ -148,3 +148,61 @@ func (t *Table) decodeIntoExactKernel(dst, src []byte) (int, error) {
 	}
 	return dstPos, nil
 }
+
+// decodeIntoExactTrustedKernel specializes the common escape-free prefix of a
+// previously validated stream. Escapes and the short tail return to the fully
+// checked kernel, keeping this duplicate limited to the one hot basic block.
+func (t *Table) decodeIntoExactTrustedKernel(dst, src []byte) (int, error) {
+	if len(src) == 0 {
+		return 0, nil
+	}
+
+	srcBase := unsafe.Pointer(unsafe.SliceData(src))
+	dstBase := unsafe.Pointer(unsafe.SliceData(dst))
+	symbolBase := unsafe.Pointer(&t.decSymbol[0])
+	lengthBase := unsafe.Pointer(&t.decLen[0])
+	srcPos, dstPos := 0, 0
+
+	for len(src)-srcPos >= 8 && len(dst)-dstPos >= 64 {
+		codes := *(*uint64)(unsafe.Add(srcBase, srcPos))
+		escapeMask := (codes & decodeHighBits) & ((((^codes) & decodeLowBits) + decodeLowBits) ^ decodeHighBits)
+		if escapeMask != 0 {
+			break
+		}
+
+		code0 := byte(codes)
+		*(*uint64)(unsafe.Add(dstBase, dstPos)) = *(*uint64)(unsafe.Add(symbolBase, uintptr(code0)*8))
+		dstPos += int(*(*byte)(unsafe.Add(lengthBase, uintptr(code0))))
+		code1 := byte(codes >> 8)
+		*(*uint64)(unsafe.Add(dstBase, dstPos)) = *(*uint64)(unsafe.Add(symbolBase, uintptr(code1)*8))
+		dstPos += int(*(*byte)(unsafe.Add(lengthBase, uintptr(code1))))
+		code2 := byte(codes >> 16)
+		*(*uint64)(unsafe.Add(dstBase, dstPos)) = *(*uint64)(unsafe.Add(symbolBase, uintptr(code2)*8))
+		dstPos += int(*(*byte)(unsafe.Add(lengthBase, uintptr(code2))))
+		code3 := byte(codes >> 24)
+		*(*uint64)(unsafe.Add(dstBase, dstPos)) = *(*uint64)(unsafe.Add(symbolBase, uintptr(code3)*8))
+		dstPos += int(*(*byte)(unsafe.Add(lengthBase, uintptr(code3))))
+		code4 := byte(codes >> 32)
+		*(*uint64)(unsafe.Add(dstBase, dstPos)) = *(*uint64)(unsafe.Add(symbolBase, uintptr(code4)*8))
+		dstPos += int(*(*byte)(unsafe.Add(lengthBase, uintptr(code4))))
+		code5 := byte(codes >> 40)
+		*(*uint64)(unsafe.Add(dstBase, dstPos)) = *(*uint64)(unsafe.Add(symbolBase, uintptr(code5)*8))
+		dstPos += int(*(*byte)(unsafe.Add(lengthBase, uintptr(code5))))
+		code6 := byte(codes >> 48)
+		*(*uint64)(unsafe.Add(dstBase, dstPos)) = *(*uint64)(unsafe.Add(symbolBase, uintptr(code6)*8))
+		dstPos += int(*(*byte)(unsafe.Add(lengthBase, uintptr(code6))))
+		code7 := byte(codes >> 56)
+		*(*uint64)(unsafe.Add(dstBase, dstPos)) = *(*uint64)(unsafe.Add(symbolBase, uintptr(code7)*8))
+		dstPos += int(*(*byte)(unsafe.Add(lengthBase, uintptr(code7))))
+		srcPos += 8
+	}
+
+	if srcPos < len(src) {
+		n, err := t.decodeIntoExactKernel(dst[dstPos:], src[srcPos:])
+		return dstPos + n, err
+	}
+	runtime.KeepAlive(dst)
+	runtime.KeepAlive(src)
+	runtime.KeepAlive(t)
+	return dstPos, nil
+}

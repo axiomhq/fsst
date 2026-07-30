@@ -77,6 +77,13 @@ func TestDecodeIntoExactRoundTrip(t *testing.T) {
 			if legacy := table.Decode(nil, compressed); !bytes.Equal(decoded, legacy) {
 				t.Fatal("exact and legacy decoders disagree")
 			}
+			trusted, err := table.DecodeIntoExactTrusted(make([]byte, 0, len(tt.input)), compressed, len(tt.input))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(trusted, decoded) {
+				t.Fatal("trusted and checked exact decoders disagree")
+			}
 		})
 	}
 }
@@ -228,6 +235,18 @@ func BenchmarkDecodeIntoExactCommonPrefix(b *testing.B) {
 		for b.Loop() {
 			var err error
 			benchmarkDecoded, err = table.DecodeIntoExact(buf, compressed, len(plain))
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("ExactTrusted", func(b *testing.B) {
+		buf := make([]byte, 0, len(plain))
+		b.SetBytes(int64(len(plain)))
+		b.ReportAllocs()
+		for b.Loop() {
+			var err error
+			benchmarkDecoded, err = table.DecodeIntoExactTrusted(buf, compressed, len(plain))
 			if err != nil {
 				b.Fatal(err)
 			}
