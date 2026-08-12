@@ -2,6 +2,8 @@ package fsst
 
 import (
 	"bytes"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -187,6 +189,50 @@ func TestReadFromMalformed(t *testing.T) {
 		_, err := tbl.ReadFrom(bytes.NewReader(data[:8]))
 		if err == nil {
 			t.Fatalf("expected error on truncated input")
+		}
+	})
+}
+
+func TestEncodeBatch(t *testing.T) {
+	inputs := [][]byte{
+		[]byte("Hello, World!"),
+		[]byte("FSST compression is fast"),
+		nil,
+		[]byte("x"),
+		[]byte("The quick brown fox jumps over the lazy dog"),
+	}
+	tbl := Train(inputs)
+
+	var want []byte
+	wantOffsets := []int{0}
+	for _, input := range inputs {
+		want = append(want, tbl.EncodeAll(input)...)
+		wantOffsets = append(wantOffsets, len(want))
+	}
+
+	got, gotOffsets := tbl.EncodeBatch(nil, nil, inputs)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("encoded bytes differ: got %v, want %v", got, want)
+	}
+	if !slices.Equal(gotOffsets, wantOffsets) {
+		t.Fatalf("offsets differ: got %v, want %v", gotOffsets, wantOffsets)
+	}
+
+	t.Run("empty", func(t *testing.T) {
+		got, offsets := tbl.EncodeBatch(nil, nil, nil)
+		if len(got) != 0 || !slices.Equal(offsets, []int{0}) {
+			t.Fatalf("got %v, %v", got, offsets)
+		}
+	})
+
+	t.Run("reuses_buffers", func(t *testing.T) {
+		dst := make([]byte, 0, 2*len(bytes.Join(inputs, nil))+outputPadding)
+		offsets := make([]int, 0, len(inputs)+1)
+		allocs := testing.AllocsPerRun(100, func() {
+			dst, offsets = tbl.EncodeBatch(dst, offsets, inputs)
+		})
+		if allocs != 0 {
+			t.Fatalf("EncodeBatch allocated %v times, want 0", allocs)
 		}
 	})
 }
@@ -452,6 +498,46 @@ func BenchmarkDecodeBatch(b *testing.B) {
 		b.StopTimer()
 		if err != nil {
 			b.Fatal(err)
+		}
+	})
+}
+
+func BenchmarkEncodeBatch(b *testing.B) {
+	const n = 100_000
+	inputs := make([][]byte, n)
+	totalInput := 0
+	paths := []string{"/api/v1/users/", "/api/v1/orders/", "/api/v1/products/", "/api/v2/users/", "/api/v2/orders/"}
+	for i := range inputs {
+		inputs[i] = []byte("https://example.com" + paths[i%len(paths)] + strconv.Itoa(i))
+		totalInput += len(inputs[i])
+	}
+	tbl := Train(inputs)
+
+	b.Run("per_string", func(b *testing.B) {
+		dst := make([]byte, 0, totalInput/2+1)
+		offsets := make([]int, n+1)
+		var scratch []byte
+		b.SetBytes(int64(totalInput))
+		b.ReportAllocs()
+		for b.Loop() {
+			dst = dst[:0]
+			for i, input := range inputs {
+				offsets[i] = len(dst)
+				encoded := tbl.EncodeInto(scratch[:0], input)
+				dst = append(dst, encoded...)
+				scratch = encoded[:0]
+			}
+			offsets[n] = len(dst)
+		}
+	})
+
+	b.Run("batch", func(b *testing.B) {
+		dst := make([]byte, 0, totalInput/2+1)
+		offsets := make([]int, 0, n+1)
+		b.SetBytes(int64(totalInput))
+		b.ReportAllocs()
+		for b.Loop() {
+			dst, offsets = tbl.EncodeBatch(dst, offsets, inputs)
 		}
 	})
 }
