@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"slices"
 )
 
 // Table holds a trained symbol table for compression and decompression.
@@ -410,8 +411,10 @@ func (t *Table) Encode(buf, input []byte) []byte {
 	} else {
 		buf = buf[:cap(buf)]
 	}
+	return buf[:t.encode(buf, 0, input)]
+}
 
-	outPos := 0
+func (t *Table) encode(buf []byte, outPos int, input []byte) int {
 	inputLen := len(input)
 	position := 0
 
@@ -428,7 +431,7 @@ func (t *Table) Encode(buf, input []byte) []byte {
 		copy(t.encBuf[:tailLen], input[position:])
 		outPos = t.encodeChunk(buf, outPos, t.encBuf, tailLen)
 	}
-	return buf[:outPos]
+	return outPos
 }
 
 // EncodeInto compresses input while reusing buf. It is the named-buffer form
@@ -440,6 +443,28 @@ func (t *Table) EncodeInto(buf, input []byte) []byte {
 // EncodeAll compresses input and returns a newly allocated slice.
 func (t *Table) EncodeAll(input []byte) []byte {
 	return t.Encode(nil, input)
+}
+
+// EncodeBatch compresses inputs independently into one code buffer. The
+// returned offsets delimit each input's encoded bytes and both result buffers
+// reuse dst and dstOffsets when their capacities are sufficient.
+func (t *Table) EncodeBatch(dst []byte, dstOffsets []int, inputs [][]byte) ([]byte, []int) {
+	dst = dst[:0]
+	if cap(dstOffsets) < len(inputs)+1 {
+		dstOffsets = make([]int, len(inputs)+1)
+	} else {
+		dstOffsets = dstOffsets[:len(inputs)+1]
+	}
+
+	outPos := 0
+	for i, input := range inputs {
+		dstOffsets[i] = outPos
+		dst = slices.Grow(dst[:outPos], 2*len(input)+outputPadding)
+		dst = dst[:cap(dst)]
+		outPos = t.encode(dst, outPos, input)
+	}
+	dstOffsets[len(inputs)] = outPos
+	return dst[:outPos], dstOffsets
 }
 
 // encodeChunk compresses buf[0:end] into dst starting at dstPos using a
