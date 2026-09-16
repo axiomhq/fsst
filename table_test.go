@@ -2,6 +2,7 @@ package fsst
 
 import (
 	"bytes"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -58,7 +59,7 @@ func TestRebuildTableRoundtrip(t *testing.T) {
 	if _, err := tbl2.ReadFrom(&buf); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	comp := tbl2.EncodeAll(input)
+	comp := tbl.EncodeAll(input)
 	got := tbl2.DecodeAll(comp)
 	if !bytes.Equal(got, input) {
 		t.Fatalf("rebuild roundtrip mismatch")
@@ -371,6 +372,52 @@ func TestDecodeBatch(t *testing.T) {
 			}
 		}
 	})
+}
+
+// BenchmarkReadFrom measures deserialization of small and representative tables.
+func BenchmarkReadFrom(b *testing.B) {
+	representative, err := os.ReadFile("testdata/logs_apache_2k.log")
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	cases := []struct {
+		name  string
+		input []byte
+	}{
+		{name: "small", input: []byte("hello world hello")},
+		{name: "representative", input: representative},
+	}
+	for _, tc := range cases {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			table := Train([][]byte{tc.input})
+			serialized, err := table.MarshalBinary()
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			var (
+				receiver Table
+				reader   bytes.Reader
+				n        int64
+				readErr  error
+			)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				reader.Reset(serialized)
+				n, readErr = receiver.ReadFrom(&reader)
+			}
+			b.StopTimer()
+			if readErr != nil {
+				b.Fatal(readErr)
+			}
+			if n != int64(len(serialized)) {
+				b.Fatalf("read %d bytes, want %d", n, len(serialized))
+			}
+		})
+	}
 }
 
 // BenchmarkDecode benchmarks different decode scenarios
