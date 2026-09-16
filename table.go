@@ -47,6 +47,13 @@ var (
 // newTable creates an initialized empty table.
 func newTable() *Table {
 	t := &Table{}
+	t.reset()
+	return t
+}
+
+// reset restores a newly initialized table without allocating one.
+func (t *Table) reset() {
+	t.resetForRead()
 	// Codes 0-255 are escape codes for literal bytes
 	for i := range 256 {
 		t.symbols[i] = newSymbolFromByte(byte(i), packCodeLength(uint16(i), 1))
@@ -67,7 +74,16 @@ func newTable() *Table {
 	for i := range 65536 {
 		t.shortCodes[i] = packCodeLength(uint16(i&mask8), 1)
 	}
-	return t
+}
+
+// resetForRead clears state that ReadFrom fills before rebuilding indexes.
+func (t *Table) resetForRead() {
+	t.nSymbols = 0
+	t.suffixLim = 0
+	clear(t.lenHisto[:])
+	clear(t.decLen[:])
+	clear(t.decSymbol[:])
+	t.encBuf = nil
 }
 
 // clearSymbols removes all learned symbols and restores lookup tables to defaults.
@@ -313,12 +329,14 @@ func (t *Table) WriteTo(w io.Writer) (int64, error) {
 }
 
 // ReadFrom deserializes a Table from r.
-func (t *Table) ReadFrom(r io.Reader) (int64, error) {
-	*t = *newTable()
-	var (
-		n   int64
-		hdr [8]byte
-	)
+func (t *Table) ReadFrom(r io.Reader) (n int64, err error) {
+	t.resetForRead()
+	defer func() {
+		if err != nil {
+			t.reset()
+		}
+	}()
+	var hdr [8]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return n, err
 	}
