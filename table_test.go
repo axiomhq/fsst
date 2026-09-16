@@ -194,6 +194,32 @@ func TestReadFromMalformed(t *testing.T) {
 	})
 }
 
+func TestReadFromResetsAfterError(t *testing.T) {
+	original := Train([][]byte{[]byte(strings.Repeat("read from reset test ", 32))})
+	var buf bytes.Buffer
+	if _, err := original.WriteTo(&buf); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	data := buf.Bytes()
+	if len(data) < 2 {
+		t.Fatal("serialized table is too small to truncate")
+	}
+
+	receiver := *Train([][]byte{[]byte("stale receiver symbols")})
+	if _, err := receiver.ReadFrom(bytes.NewReader(data[:len(data)-1])); err == nil {
+		t.Fatal("expected truncated symbol data to fail")
+	}
+
+	expected := newTable()
+	if receiver.nSymbols != expected.nSymbols || receiver.suffixLim != expected.suffixLim ||
+		receiver.lenHisto != expected.lenHisto || receiver.decLen != expected.decLen ||
+		receiver.decSymbol != expected.decSymbol || receiver.encBuf != nil ||
+		receiver.symbols != expected.symbols || receiver.byteCodes != expected.byteCodes ||
+		receiver.shortCodes != expected.shortCodes || receiver.hashTab != expected.hashTab {
+		t.Fatal("failed ReadFrom left receiver partially loaded")
+	}
+}
+
 func TestEncodeBatch(t *testing.T) {
 	inputs := [][]byte{
 		[]byte("Hello, World!"),
