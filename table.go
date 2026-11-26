@@ -732,7 +732,7 @@ func (t *Table) DecodeBatch(dst []byte, dstOffsets []int, src []byte, srcOffsets
 			continue
 		}
 		// Retry from the row boundary after capacity exhaustion or a checked
-		// kernel error. This preserves legacy growth and error behavior.
+		// kernel error. This preserves existing growth and error behavior.
 		for srcPos := srcStart; srcPos < srcEnd; {
 			code := src[srcPos]
 			srcPos++

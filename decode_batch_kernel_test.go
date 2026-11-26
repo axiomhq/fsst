@@ -61,7 +61,9 @@ func TestDecodeBatchKernelCapacity(t *testing.T) {
 	}
 }
 
-func TestDecodeBatchKernelLegacyErrors(t *testing.T) {
+// Preserve existing behavior across output capacities: return partial output for
+// a truncated escape, keep escapes within row boundaries, and skip undefined codes.
+func TestDecodeBatchKernelErrors(t *testing.T) {
 	table := fullDecodeTable()
 	for _, capacity := range []int{0, 64, 1024} {
 		// An escape cannot consume the first byte of the next row.
@@ -71,7 +73,7 @@ func TestDecodeBatchKernelLegacyErrors(t *testing.T) {
 		if err != ErrCorrupted || !bytes.Equal(got, want) || !reflect.DeepEqual(offsets, []int{0}) {
 			t.Fatalf("capacity %d: malformed row result differs", capacity)
 		}
-		// Legacy batch decode skips undefined codes. Preserve that behavior.
+		// Batch decode skips undefined codes. Preserve that behavior.
 		table.decLen[17] = 0
 		got, _, err = table.DecodeBatch(make([]byte, 0, capacity), nil, bytes.Repeat([]byte{17}, 80), []int{0, 80})
 		table.decLen[17] = 2
