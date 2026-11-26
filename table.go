@@ -711,8 +711,9 @@ func (t *Table) DecodeAll(src []byte) []byte {
 // be the same slice as srcOffsets; dst must not overlap src. The returned
 // offsets have n+1 entries marking each decompressed string's boundaries.
 //
-// This avoids per-string allocation and function-call overhead, keeping the
-// decoder tables hot in cache across all strings.
+// DecodeBatch uses the bounded exact decoder kernel with the remaining output
+// capacity. Individual decoded lengths are not required. If the kernel cannot
+// finish a string, the scalar decoder retries it and grows dst as necessary.
 func (t *Table) DecodeBatch(dst []byte, dstOffsets []int, src []byte, srcOffsets []int) ([]byte, []int, error) {
 	dst = dst[:0]
 	dstOffsets = dstOffsets[:0]
@@ -740,6 +741,16 @@ func (t *Table) DecodeBatch(dst []byte, dstOffsets []int, src []byte, srcOffsets
 	for i := range n {
 		srcStart, srcEnd := srcOffsets[i], srcOffsets[i+1]
 		dstOffsets[i] = len(dst)
+		// The kernel reports the actual size and bounds every access by the
+		// compressed row and available output capacity. Its wide stores can
+		// touch spare capacity, but cannot overwrite an earlier decoded row.
+		start := len(dst)
+		if written, err := t.decodeIntoExactKernel(dst[start:cap(dst)], src[srcStart:srcEnd]); err == nil {
+			dst = dst[:start+written]
+			continue
+		}
+		// Retry from the row boundary after capacity exhaustion or a checked
+		// kernel error. This preserves existing growth and error behavior.
 		for srcPos := srcStart; srcPos < srcEnd; {
 			code := src[srcPos]
 			srcPos++
