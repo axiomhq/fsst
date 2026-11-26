@@ -61,8 +61,6 @@ func TestDecodeBatchKernelCapacity(t *testing.T) {
 	}
 }
 
-// Preserve existing behavior across output capacities: return partial output for
-// a truncated escape, keep escapes within row boundaries, and skip undefined codes.
 func TestDecodeBatchKernelErrors(t *testing.T) {
 	table := fullDecodeTable()
 	for _, capacity := range []int{0, 64, 1024} {
